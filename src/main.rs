@@ -1,10 +1,9 @@
 use std::cmp::Ordering;
 use std::env;
-use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 mod lan;
-use lan::{ColorRGB, MeasureRequest, ShapeInstruction, spawn_worker};
+use lan::{ColorRGB, ShapeInstruction, SharedState, spawn_worker};
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 
@@ -116,22 +115,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
-    let measurement_interval = Duration::from_secs(1);
-    let mut need_initial_measure = false;
-    let mut last_measure_sent = Instant::now();
     let mut current_measure_colour = ColorRGB::default();
     let mut shapes: Vec<ShapeInstruction> = Vec::new();
     let mut scene_dirty = true;
 
-    let mut worker: Option<(
-        std::sync::mpsc::Sender<MeasureRequest>,
-        std::sync::mpsc::Receiver<Result<lan::MeasurementResult, String>>,
-    )> = None;
+    let mut worker: Option<std::sync::Arc<std::sync::RwLock<SharedState>>> = None;
     if let Some(addr) = remote_addr.clone() {
         match spawn_worker(&addr) {
-            Ok((tx, rx)) => {
-                worker = Some((tx, rx));
-                need_initial_measure = true;
+            Ok(state) => {
+                worker = Some(state);
                 scene_dirty = true;
             }
             Err(e) => {
@@ -153,96 +145,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let mut worker_disconnected = false;
-        let mut received_update = false;
-        if let Some((tx, rx)) = worker.as_ref() {
-            loop {
-                match rx.try_recv() {
-                    Ok(Ok(res)) => {
-                        let lan::MeasurementResult {
-                            red,
-                            green,
-                            blue,
-                            x,
-                            y,
-                            y_lum,
-                            shapes: new_shapes,
-                        } = res;
-                        let measurement_colour = ColorRGB::from_components(red, green, blue);
-                        if !new_shapes.is_empty() {
-                            let shape_colour =
-                                select_measure_colour(&new_shapes).unwrap_or(measurement_colour);
-                            current_measure_colour = shape_colour;
-                            shapes = new_shapes;
-                        } else {
-                            current_measure_colour = measurement_colour;
-                            shapes.clear();
-                        }
-                        scene_dirty = true;
-                        received_update = true;
-                        println!("Measured result: x={:?} y={:?} y_lum={:?}", x, y, y_lum);
-                    }
-                    Ok(Err(e)) => {
-                        println!("Measurement error: {}", e);
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        println!("ColourSpace worker disconnected");
-                        worker_disconnected = true;
-                        break;
-                    }
-                }
-            }
-
-            if !worker_disconnected
-                && (need_initial_measure || last_measure_sent.elapsed() >= measurement_interval)
+        if let Some(state) = worker.as_ref() {
+            // Update the request colour so the sending thread can send it.
             {
-                let colour = current_measure_colour;
-                match tx.send(MeasureRequest {
-                    red: colour.red,
-                    green: colour.green,
-                    blue: colour.blue,
-                }) {
-                    Ok(_) => {
-                        need_initial_measure = false;
-                        last_measure_sent = Instant::now();
+                let mut w = state.write().unwrap();
+                w.request_colour = current_measure_colour;
+            }
+
+            // Read the shared shapes/measurement for drawing
+            {
+                let r = state.read().unwrap();
+                worker_disconnected = !r.connected;
+                if r.scene_dirty {
+                    shapes = r.shapes.clone();
+                    if shapes.is_empty() {
+                        current_measure_colour = r.current_measure_colour;
+                    } else {
+                        current_measure_colour = select_measure_colour(&shapes).unwrap_or(r.current_measure_colour);
                     }
-                    Err(_) => {
-                        worker_disconnected = true;
-                    }
+                    scene_dirty = true;
                 }
             }
-        }
 
-        if worker_disconnected {
-            worker = None;
-            need_initial_measure = false;
-            shapes.clear();
-            current_measure_colour = ColorRGB::default();
-            scene_dirty = true;
-        }
+            if worker_disconnected {
+                worker = None;
+                shapes.clear();
+                current_measure_colour = ColorRGB::default();
+                scene_dirty = true;
+            }
 
-        if worker.is_some() {
-            if scene_dirty {
-                if shapes.is_empty() {
-                    let colour = current_measure_colour;
-                    canvas.set_draw_color(Color::RGB(colour.red, colour.green, colour.blue));
-                    canvas.clear();
+            if !worker_disconnected {
+                if scene_dirty {
+                    if shapes.is_empty() {
+                        let colour = current_measure_colour;
+                        canvas.set_draw_color(Color::RGB(colour.red, colour.green, colour.blue));
+                        canvas.clear();
+                    } else {
+                        draw_shapes(&mut canvas, &shapes, width, height);
+                    }
+                    canvas.present();
+                    scene_dirty = false;
+
+                    _frames += 1;
+                    if last_fps.elapsed() >= Duration::from_secs(1) {
+                        _frames = 0;
+                        last_fps = Instant::now();
+                    }
                 } else {
-                    draw_shapes(&mut canvas, &shapes, width, height);
+                    std::thread::sleep(Duration::from_millis(2));
                 }
-                canvas.present();
-                scene_dirty = false;
-
-                _frames += 1;
-                if last_fps.elapsed() >= Duration::from_secs(1) {
-                    //println!("FPS: {}", _frames);
-                    _frames = 0;
-                    last_fps = Instant::now();
-                }
-            } else if !received_update {
-                std::thread::sleep(Duration::from_millis(2));
+                continue;
             }
-            continue;
         }
 
         let elapsed = t0.elapsed().as_secs_f32();
