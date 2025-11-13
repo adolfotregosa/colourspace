@@ -1,4 +1,5 @@
 use argh::FromArgs;
+use tinyfiledialogs as tfd;
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
@@ -62,6 +63,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         height: Option<u32>,
     }
 
+    // Very small native dialog UI shown when the program is launched with no
+    // command-line arguments. Uses tinyfiledialogs for cross-platform native
+    // dialogs. Returns None if the user cancels any dialog.
+    fn show_startup_ui() -> Option<Args> {
+        // Ask for server (default)
+        let server_default = "127.0.0.1:20002";
+        let server = tfd::input_box("Colourspace - Server", "Server (host[:port]):", server_default);
+        let server = match server {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return None,
+        };
+
+        // Windowed? yes/no (use an input box for a simple cross-platform prompt)
+        let windowed = match tfd::input_box("Windowed?", "Run windowed instead of fullscreen? (y/N)", "N") {
+            Some(s) => matches!(s.trim().to_lowercase().as_str(), "y" | "yes"),
+            None => return None,
+        };
+
+        // Width and height (only useful if windowed); provide defaults
+        let width = if windowed {
+            match tfd::input_box("Window width", "Window width (pixels):", "800") {
+                Some(s) => match s.trim().parse::<u32>() {
+                    Ok(v) => Some(v),
+                    Err(_) => Some(800),
+                },
+                None => return None,
+            }
+        } else {
+            None
+        };
+
+        let height = if windowed {
+            match tfd::input_box("Window height", "Window height (pixels):", "600") {
+                Some(s) => match s.trim().parse::<u32>() {
+                    Ok(v) => Some(v),
+                    Err(_) => Some(600),
+                },
+                None => return None,
+            }
+        } else {
+            None
+        };
+
+        // Pretty-print option
+        let pretty_print = match tfd::input_box("Pretty-print?", "Enable pretty-print logging of received XML? (y/N)", "N") {
+            Some(s) => matches!(s.trim().to_lowercase().as_str(), "y" | "yes"),
+            None => return None,
+        };
+
+        Some(Args {
+            remote: Some(server),
+            pretty_print,
+            windowed,
+            width,
+            height,
+        })
+    }
+
     fn select_measure_colour(shapes: &[ShapeInstruction]) -> Option<ColorRGB> {
         shapes
             .iter()
@@ -112,7 +171,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let args: Args = argh::from_env();
+    // If run with no CLI arguments, show a tiny native UI to gather options.
+    let args: Args = if std::env::args().len() <= 1 {
+        match show_startup_ui() {
+            Some(a) => a,
+            None => return Ok(()),
+        }
+    } else {
+        argh::from_env()
+    };
     let remote_addr: Option<String> = args.remote.map(|s| add_default_port(&s));
 
     let mut current_measure_colour = ColorRGB::default();
