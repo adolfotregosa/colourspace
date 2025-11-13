@@ -1,6 +1,7 @@
 use argh::FromArgs;
 use tinyfiledialogs as tfd;
 use std::time::{Duration, Instant};
+use std::thread::sleep;
 
 mod lan;
 use lan::{ColorRGB, ShapeInstruction, spawn_worker};
@@ -14,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const DEFAULT_W: u32 = 1280;
     const DEFAULT_H: u32 = 720;
 
-    // Build window (no worker yet) so UI appears quickly
+    // Always start windowed; fullscreen only via double-click
     let window = video
     .window("Calibration Client 2.0", DEFAULT_W, DEFAULT_H)
     .position_centered()
@@ -90,6 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match shape {
                 ShapeInstruction::Rectangle(rect) => {
                     let geom = rect.geometry;
+                    // clamp widths/heights and ensure at least 1 pixel
                     let rw = (geom.width.clamp(0.0, 1.0) * w as f32).round().max(1.0) as u32;
                     let rh = (geom.height.clamp(0.0, 1.0) * h as f32).round().max(1.0) as u32;
 
@@ -116,18 +118,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => return Ok(()),
         },
     };
-
     let remote_addr = add_default_port(&remote);
 
-    // Build canvas WITH vsync so present() blocks to refresh
-    let mut canvas = window.into_canvas().present_vsync().build()?;
-    // Show an initial clear immediately so the window appears fast
-    canvas.set_draw_color(Color::RGB(0, 0, 0));
-    canvas.clear();
-    canvas.present();
-
-    // Now spawn the worker (may do network operations); UI is already visible
+    // ---------------------------------------------------------------------
+    // NETWORK WORKER SETUP
+    // ---------------------------------------------------------------------
     let mut current_measure_colour = ColorRGB::default();
+
     let worker = match spawn_worker(&remote_addr, false) {
         Ok(state) => {
             state.write().unwrap().request_colour = current_measure_colour;
@@ -139,6 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let mut canvas = window.into_canvas().build()?;
     let mut event_pump = sdl_context.event_pump()?;
 
     // double-click detection
@@ -146,17 +144,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut is_fullscreen = false;
     let dc_threshold = Duration::from_millis(400);
 
-    // bookkeeping for dirty-check
-    let mut last_shapes_hash: u64 = 0;
-    let mut last_shapes_len: usize = 0;
-    let mut last_measure_colour = ColorRGB::default();
-    let mut last_rendered_fullscreen = is_fullscreen;
+    // FPS bookkeeping (unused but left intentionally)
+    let _last_fps = Instant::now();
+    let mut _frames = 0u32;
 
-    // event wait timeout (u32)
+    // Use u32 here because wait_event_timeout expects u32
     const EVENT_WAIT_MS: u32 = 8;
 
     'running: loop {
-        // Wait for a single event or timeout; then drain any extra queued events
+        // wait_event_timeout takes a u32; it returns None on timeout
+        // handle the first event (if any) and then drain remaining queued events via poll_iter()
         if let Some(event) = event_pump.wait_event_timeout(EVENT_WAIT_MS) {
             match event {
                 sdl2::event::Event::Quit { .. }
@@ -192,9 +189,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => {}
             }
 
-            // Drain remaining events to avoid reprocessing next frame
-            for evt in event_pump.poll_iter() {
-                match evt {
+            // Drain any other queued events so we don't process them next frame
+            for event in event_pump.poll_iter() {
+                match event {
                     sdl2::event::Event::Quit { .. }
                     | sdl2::event::Event::KeyDown {
                         keycode: Some(sdl2::keyboard::Keycode::Escape),
@@ -229,92 +226,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Read worker state once per frame
-        let (disconnected, shapes_snapshot_len, computed_shapes_hash, worker_current_colour) =
-        if let Some(state) = worker.as_ref() {
+        // One read of the worker state per frame (if any)
+        let (disconnected, shapes, worker_current_colour) = if let Some(state) = worker.as_ref() {
             let r = state.read().unwrap();
-
-            // If there are no shapes, skip hashing loop entirely (fast path).
-            if r.shapes.is_empty() {
-                ( !r.connected, 0usize, 0u64, r.current_measure_colour )
-            } else {
-                // Compute a cheap hash from shapes *without cloning* the Vec
-                let mut h: u64 = r.shapes.len() as u64;
-                for shape in r.shapes.iter() {
-                    match shape {
-                        ShapeInstruction::Rectangle(rect) => {
-                            let w_bits = rect.geometry.width.to_bits() as u64;
-                            let h_bits = rect.geometry.height.to_bits() as u64;
-                            let color_word = ((rect.color.red as u64) << 16)
-                            | ((rect.color.green as u64) << 8)
-                            | (rect.color.blue as u64);
-                            h = h.wrapping_mul(31).wrapping_add(w_bits);
-                            h = h.wrapping_mul(31).wrapping_add(h_bits);
-                            h = h.wrapping_mul(31).wrapping_add(color_word);
-                        }
-                    }
-                }
-                ( !r.connected, r.shapes.len(), h, r.current_measure_colour )
-            }
+            (!r.connected, r.shapes.clone(), r.current_measure_colour)
         } else {
-            ( true, 0usize, 0u64, ColorRGB::default() )
+            (true, Vec::new(), ColorRGB::default())
         };
 
-        // Decide whether to repaint:
-        let measure_changed = worker_current_colour != last_measure_colour;
-        let fullscreen_changed = last_rendered_fullscreen != is_fullscreen;
-        let shapes_changed = computed_shapes_hash != last_shapes_hash || shapes_snapshot_len != last_shapes_len;
-
-        // If shapes changed and we need the full shapes for drawing, clone them now.
-        // Otherwise avoid cloning entirely.
-        let mut shapes_clone: Vec<ShapeInstruction> = Vec::new();
-        if shapes_changed {
-            if let Some(state) = worker.as_ref() {
-                let r = state.read().unwrap();
-                shapes_clone = r.shapes.clone(); // only clone when checksum changed
-            }
-        }
-
-        // Update current_measure_colour similar to previous behaviour:
+        // Update current measure colour depending on worker state and shapes
         if disconnected {
             if worker.is_none() {
-                // keep existing current_measure_colour
+                // keep whatever current_measure_colour already is
             } else {
                 current_measure_colour = worker_current_colour;
             }
         } else {
-            if shapes_clone.is_empty() && shapes_snapshot_len == 0 {
+            if shapes.is_empty() {
                 current_measure_colour = worker_current_colour;
-            } else if !shapes_clone.is_empty() {
-                current_measure_colour = select_measure_colour(&shapes_clone).unwrap_or(current_measure_colour);
-            }
-        }
-
-        // Decide whether we actually need to render/present:
-        let need_present = shapes_changed || measure_changed || fullscreen_changed;
-
-        if need_present {
-            let (cw, ch) = canvas.output_size()?;
-
-            if !disconnected && !shapes_clone.is_empty() {
-                draw_shapes(&mut canvas, &shapes_clone, cw, ch);
             } else {
-                let c = current_measure_colour;
-                canvas.set_draw_color(Color::RGB(c.red, c.green, c.blue));
-                canvas.clear();
+                current_measure_colour = select_measure_colour(&shapes).unwrap_or(current_measure_colour);
             }
-
-            // Present once per frame (vsync will throttle)
-            canvas.present();
-
-            // update last seen values
-            last_shapes_hash = computed_shapes_hash;
-            last_shapes_len = shapes_snapshot_len;
-            last_measure_colour = worker_current_colour;
-            last_rendered_fullscreen = is_fullscreen;
         }
 
-        // No extra sleep needed: wait_event_timeout handles idle waiting and present_vsync throttles drawing.
+        // Draw
+        let (cw, ch) = canvas.output_size()?;
+        if !disconnected && !shapes.is_empty() {
+            draw_shapes(&mut canvas, &shapes, cw, ch);
+        } else {
+            let c = current_measure_colour;
+            canvas.set_draw_color(Color::RGB(c.red, c.green, c.blue));
+            canvas.clear();
+        }
+
+        // Present once per frame (consistent timing fixes the double-click quirk)
+        canvas.present();
+
+        // small sleep to avoid burning CPU in pathological cases
+        sleep(Duration::from_millis(1));
     }
 
     Ok(())
