@@ -60,10 +60,7 @@ pub enum ShapeInstruction {
 
 /// Pretty-print XML for optional logging (module-level so threads can call it).
 fn pretty_print_xml(xml: &str) -> Result<String, XmlError> {
-    fn format_start_tag(
-        reader: &Reader<&[u8]>,
-        element: &BytesStart,
-    ) -> Result<String, XmlError> {
+    fn format_start_tag(reader: &Reader<&[u8]>, element: &BytesStart) -> Result<String, XmlError> {
         let mut line = String::new();
         line.push('<');
         line.push_str(&String::from_utf8_lossy(element.name().as_ref()));
@@ -194,9 +191,16 @@ fn log_received_xml(xml: &str) -> std::io::Result<()> {
         }
     };
 
-    let log_path = std::env::var("COLOURSPACE_XML_LOG").unwrap_or_else(|_| "colourspace_commands.log".to_string());
-    let mut file = OpenOptions::new().create(true).append(true).open(&log_path)?;
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+    let log_path = std::env::var("COLOURSPACE_XML_LOG")
+        .unwrap_or_else(|_| "colourspace_commands.log".to_string());
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
     writeln!(file, "----- Received at {:.3} -----", timestamp)?;
     file.write_all(pretty.as_bytes())?;
     if !pretty.ends_with('\n') {
@@ -224,7 +228,6 @@ impl Default for SharedState {
             shapes: Vec::new(),
             current_measure_colour: ColorRGB::default(),
             request_colour: ColorRGB::default(),
-            
         }
     }
 }
@@ -257,9 +260,9 @@ fn read_message_from_stream(stream: &mut TcpStream) -> std::io::Result<Option<St
     }
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload)?;
-    String::from_utf8(payload).map(Some).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8 payload")
-    })
+    String::from_utf8(payload)
+        .map(Some)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8 payload"))
 }
 
 /// Parse XML string into a MeasurementResult. The `r,g,b` parameters are the
@@ -410,9 +413,7 @@ fn parse_measurement_from_xml(xml: &str, r: u8, g: u8, b: u8) -> Result<Measurem
                             if let Some(rect) = builder.build() {
                                 parsed_shapes.push(ShapeInstruction::Rectangle(rect));
                             } else {
-                                eprintln!(
-                                    "Received rectangle command missing required attributes"
-                                );
+                                eprintln!("Received rectangle command missing required attributes");
                             }
                         }
                     }
@@ -508,7 +509,7 @@ fn parse_measurement_from_xml(xml: &str, r: u8, g: u8, b: u8) -> Result<Measurem
 /// requested colour from the shared state and writes measurement requests to
 /// the stream. Returns an `Arc<RwLock<SharedState>>` that the caller (drawing
 /// thread) can use to read the current shapes and measured colour.
-pub fn spawn_worker(addr: &str) -> std::io::Result<Arc<RwLock<SharedState>>> {
+pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLock<SharedState>>> {
     let addr = addr.to_owned();
     // Try to connect immediately; if connection fails, still return state but
     // mark it as disconnected.
@@ -535,7 +536,10 @@ pub fn spawn_worker(addr: &str) -> std::io::Result<Arc<RwLock<SharedState>>> {
         thread::spawn(move || {
             // initialize profile
             if let Ok(mut guard) = stream_recv.lock() {
-                let _ = send_xml_on_stream(&mut *guard, "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<CS_RMC version=1>\n<command>\ninit profile\n</command>\n</CS_RMC>");
+                let _ = send_xml_on_stream(
+                    &mut *guard,
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<CS_RMC version=1>\n<command>\ninit profile\n</command>\n</CS_RMC>",
+                );
             }
             loop {
                 let mut guard = match stream_recv.lock() {
@@ -546,14 +550,20 @@ pub fn spawn_worker(addr: &str) -> std::io::Result<Arc<RwLock<SharedState>>> {
                 match msg_opt_res {
                     Ok(opt) => match opt {
                         Some(msg) => {
-                            // To enable pretty-printed XML logging to file, uncomment this line:
-                            // let _ = log_received_xml(&msg);
+                            // Pretty-printing/logging if requested by CLI flag
+                            if pretty_print {
+                                let _ = log_received_xml(&msg);
+                            }
 
                             // parse measurement
                             // we don't know the exact request colour here; use defaults from state
                             let (r, g, b) = {
                                 let rguard = state_recv.read().unwrap();
-                                (rguard.request_colour.red, rguard.request_colour.green, rguard.request_colour.blue)
+                                (
+                                    rguard.request_colour.red,
+                                    rguard.request_colour.green,
+                                    rguard.request_colour.blue,
+                                )
                             };
                             match parse_measurement_from_xml(&msg, r, g, b) {
                                 Ok(meas) => {
@@ -561,12 +571,20 @@ pub fn spawn_worker(addr: &str) -> std::io::Result<Arc<RwLock<SharedState>>> {
                                     w.connected = true;
                                     if !meas.shapes.is_empty() {
                                         // choose shape colour logic is done in drawing side; we just store shapes
-                                        w.current_measure_colour = meas.shapes.get(0).map(|s| match s {
-                                            ShapeInstruction::Rectangle(r) => r.color,
-                                        }).unwrap_or(ColorRGB::from_components(meas.red, meas.green, meas.blue));
+                                        w.current_measure_colour = meas
+                                            .shapes
+                                            .get(0)
+                                            .map(|s| match s {
+                                                ShapeInstruction::Rectangle(r) => r.color,
+                                            })
+                                            .unwrap_or(ColorRGB::from_components(
+                                                meas.red, meas.green, meas.blue,
+                                            ));
                                         w.shapes = meas.shapes;
                                     } else {
-                                        w.current_measure_colour = ColorRGB::from_components(meas.red, meas.green, meas.blue);
+                                        w.current_measure_colour = ColorRGB::from_components(
+                                            meas.red, meas.green, meas.blue,
+                                        );
                                         w.shapes.clear();
                                     }
                                 }
@@ -618,7 +636,10 @@ pub fn spawn_worker(addr: &str) -> std::io::Result<Arc<RwLock<SharedState>>> {
                 // No queued commands — only send the current `request_colour`.
 
                 // compose measurement xml
-                let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<CS_RMC version=1>\n<measurement>\n<red>{}</red>\n<green>{}</green>\n<blue>{}</blue>\n</measurement>\n</CS_RMC>", r, g, b);
+                let xml = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<CS_RMC version=1>\n<measurement>\n<red>{}</red>\n<green>{}</green>\n<blue>{}</blue>\n</measurement>\n</CS_RMC>",
+                    r, g, b
+                );
                 let send_res = {
                     let mut guard = match stream_send.lock() {
                         Ok(g) => g,

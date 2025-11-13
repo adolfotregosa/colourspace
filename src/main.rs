@@ -1,5 +1,5 @@
+use argh::FromArgs;
 use std::cmp::Ordering;
-use std::env;
 use std::time::{Duration, Instant};
 
 mod lan;
@@ -33,10 +33,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_fps = Instant::now();
     let mut _frames = 0u32;
 
-    // Color animate over time for visible effect
-    let t0 = Instant::now();
+    // Do NOT animate colors locally. The program must only display colours
+    // provided by the server. Keep an initial colour, but never modify it
+    // locally (no screensaver/rainbow behaviour).
 
-    // Check for remote argument: support both `--remote host[:port]` and `--remote=host[:port]`.
     // If no port is provided, use default 20002.
     fn add_default_port(s: &str) -> String {
         // If there's a trailing :port that parses as u16, keep it. Otherwise append default.
@@ -46,6 +46,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         format!("{}:20002", s)
+    }
+
+    #[derive(FromArgs)]
+    /// Colourspace viewer
+    struct Args {
+        /// remote server host[:port]
+        #[argh(option)]
+        remote: Option<String>,
+
+        /// pretty-print and save received XML messages
+        #[argh(switch, long = "pretty-print")]
+        pretty_print: bool,
     }
 
     fn select_measure_colour(shapes: &[ShapeInstruction]) -> Option<ColorRGB> {
@@ -98,29 +110,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut remote_addr: Option<String> = None;
-    let args: Vec<String> = env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--remote" {
-            if i + 1 < args.len() {
-                remote_addr = Some(add_default_port(&args[i + 1]));
-                i += 1;
-            }
-        } else if arg.starts_with("--remote=") {
-            let v = &arg[9..];
-            remote_addr = Some(add_default_port(v));
-        }
-        i += 1;
-    }
+    let args: Args = argh::from_env();
+    let remote_addr: Option<String> = args.remote.map(|s| add_default_port(&s));
 
     let mut current_measure_colour = ColorRGB::default();
-    let mut shapes: Vec<ShapeInstruction> = Vec::new();
 
     let mut worker: Option<std::sync::Arc<std::sync::RwLock<SharedState>>> = None;
     if let Some(addr) = remote_addr.clone() {
-        match spawn_worker(&addr) {
+        match spawn_worker(&addr, args.pretty_print) {
             Ok(state) => {
                 // store the state and write the initial request colour so the
                 // sending thread sends an initial measurement immediately.
@@ -145,38 +142,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let mut worker_disconnected = false;
         if let Some(state) = worker.as_ref() {
-            // Update the request colour so the sending thread can send it.
-            {
-                let mut w = state.write().unwrap();
-                w.request_colour = current_measure_colour;
-            }
+            // Do NOT update `request_colour` each frame from the UI. The
+            // request colour is set once at startup and must not be changed
+            // by local animation or drawing logic.
 
             // Read the latest shared state each frame (no dirty flag). Use a read lock.
-            {
+            let (worker_disconnected, shapes) = {
                 let r = state.read().unwrap();
-                worker_disconnected = !r.connected;
-                shapes = r.shapes.clone();
-                if shapes.is_empty() {
-                    current_measure_colour = r.current_measure_colour;
-                } else {
-                    current_measure_colour = select_measure_colour(&shapes).unwrap_or(r.current_measure_colour);
-                }
-            }
+                (!r.connected, r.shapes.clone())
+            };
 
             if worker_disconnected {
                 // keep the worker handle (threads still own clones). Just reset the visual state until connection recovers.
-                shapes.clear();
                 current_measure_colour = ColorRGB::default();
             }
 
             if !worker_disconnected {
                 if shapes.is_empty() {
+                    // use the measured colour from the shared state
+                    let r = state.read().unwrap();
+                    current_measure_colour = r.current_measure_colour;
                     let colour = current_measure_colour;
                     canvas.set_draw_color(Color::RGB(colour.red, colour.green, colour.blue));
                     canvas.clear();
                 } else {
+                    // choose measurement colour from shapes deterministically
+                    current_measure_colour =
+                        select_measure_colour(&shapes).unwrap_or(current_measure_colour);
                     draw_shapes(&mut canvas, &shapes, width, height);
                 }
                 canvas.present();
@@ -191,11 +184,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let elapsed = t0.elapsed().as_secs_f32();
-        let r = ((elapsed * 0.3).sin() * 0.5 + 0.5) * 255.0;
-        let g = ((elapsed * 0.5).sin() * 0.5 + 0.5) * 255.0;
-        let b = ((elapsed * 0.7).sin() * 0.5 + 0.5) * 255.0;
-        current_measure_colour = ColorRGB::from_components(r as u8, g as u8, b as u8);
+        // No local colour updates — draw the most recent colour available in
+        // `current_measure_colour` (which is kept in sync with the shared
+        // state above). If there is no worker, this remains the initial
+        // colour and will not change.
         canvas.set_draw_color(Color::RGB(
             current_measure_colour.red,
             current_measure_colour.green,
@@ -206,7 +198,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         _frames += 1;
         if last_fps.elapsed() >= Duration::from_secs(1) {
-            //println!("FPS: {}", _frames);
             _frames = 0;
             last_fps = Instant::now();
         }

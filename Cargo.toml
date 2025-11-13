@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 glm = "^0.2"
 
-rust-embed = "^8.7"
+rust-embed = "^8"
 sdl2 = "^0"
 thiserror = "^2"
-quick-xml = "0.30"
+quick-xml = "^0"
+argh = "^0"
