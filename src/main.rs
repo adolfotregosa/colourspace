@@ -1,14 +1,19 @@
 use argh::FromArgs;
 use tinyfiledialogs as tfd;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
-use std::thread::sleep;
+use std::thread::{sleep, spawn};
+use std::error::Error;
 
 mod lan;
 use lan::{ColorRGB, ShapeInstruction, spawn_worker};
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     let sdl_context = sdl2::init()?;
     let video = sdl_context.video()?;
 
@@ -17,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Always start windowed; fullscreen only via double-click
     let window = video
-    .window("Calibration Client 2.0", DEFAULT_W, DEFAULT_H)
+    .window("Calibration Client Linux", DEFAULT_W, DEFAULT_H)
     .position_centered()
     .vulkan()
     .resizable()
@@ -48,14 +53,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Try 80..120 if your title is still clipped.
         const PAD_WIDTH: usize = 80;
 
-        let title = "Calibration Client 2.0";
-        let server = tfd::input_box(
-            title,
-            &pad("ColourSpace IP:", PAD_WIDTH),
-                                    "",
-        )?;
+        let title = "Calibration Client Linux";
+        let server = tfd::input_box(title, &pad("ColourSpace IP:", PAD_WIDTH), "")?;
 
-        if server.trim().is_empty() { None } else { Some(server) }
+        if server.trim().is_empty() {
+            None
+        } else {
+            Some(server)
+        }
     }
 
     fn add_default_port(s: &str) -> String {
@@ -68,7 +73,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     fn select_measure_colour(shapes: &[ShapeInstruction]) -> Option<ColorRGB> {
-        shapes.iter().filter_map(|shape| match shape {
+        shapes
+        .iter()
+        .filter_map(|shape| match shape {
             ShapeInstruction::Rectangle(rect) => {
                 let area = (rect.geometry.width * rect.geometry.height).max(0.0001);
                 Some((area, rect.color))
@@ -96,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let rh = (geom.height.clamp(0.0, 1.0) * h as f32).round().max(1.0) as u32;
 
                     let left = ((w as f32 - rw as f32) / 2.0).round() as i32;
-                    let top  = ((h as f32 - rh as f32) / 2.0).round() as i32;
+                    let top = ((h as f32 - rh as f32) / 2.0).round() as i32;
 
                     let color = rect.color;
                     canvas.set_draw_color(Color::RGB(color.red, color.green, color.blue));
@@ -111,33 +118,146 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ---------------------------------------------------------------------
     let args: Args = argh::from_env();
 
-    let remote = match args.remote {
-        Some(r) => r,
-        None => match show_startup_ui() {
-            Some(ip) => ip,
-            None => return Ok(()),
-        },
-    };
-    let remote_addr = add_default_port(&remote);
+    // ---------------------------------------------------------------------
+    // Create event pump early so we can keep the window responsive during waits
+    // ---------------------------------------------------------------------
+    let mut event_pump = sdl_context.event_pump()?;
 
     // ---------------------------------------------------------------------
-    // NETWORK WORKER SETUP
+    // STARTUP UI + NETWORK WORKER SETUP (retry on failure) - with connect timeout
+    // and non-freezing dialog handling
     // ---------------------------------------------------------------------
     let mut current_measure_colour = ColorRGB::default();
+    let mut maybe_remote = args.remote;
 
-    let worker = match spawn_worker(&remote_addr, false) {
-        Ok(state) => {
-            state.write().unwrap().request_colour = current_measure_colour;
-            Some(state)
-        }
-        Err(e) => {
-            eprintln!("Failed to spawn worker: {}", e);
-            None
+    // Increased timeout to 5000ms to give slower setups time to connect.
+    const CONNECT_TIMEOUT_MS: u64 = 5000;
+    const CONNECT_POLL_MS: u64 = 50;
+
+    // The loop yields Some(worker_state) when we have a worker that successfully connected.
+    // If the user cancels the UI, we exit cleanly.
+    let worker = loop {
+        // Use CLI-provided address once; otherwise prompt the UI.
+        let remote_input = maybe_remote.take().or_else(|| show_startup_ui());
+
+        // If the user cancelled the UI (or provided empty input), exit gracefully.
+        let remote = match remote_input {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        let remote_addr = add_default_port(&remote);
+
+        match spawn_worker(&remote_addr, false) {
+            Ok(state) => {
+                // Tell worker what colour to request initially.
+                state.write().unwrap().request_colour = current_measure_colour;
+
+                // Wait a short while for the worker thread to actually establish a connection,
+                // but keep the SDL window responsive while we wait.
+                let mut elapsed = 0u64;
+                let mut connected = {
+                    let r = state.read().unwrap();
+                    r.connected
+                };
+
+                // debug print initial state
+                eprintln!("Waiting up to {}ms for ColourSpace to connect (initial connected={})", CONNECT_TIMEOUT_MS, connected);
+
+                while !connected && elapsed < CONNECT_TIMEOUT_MS {
+                    // Poll SDL events so the window remains responsive
+                    for evt in event_pump.poll_iter() {
+                        match evt {
+                            sdl2::event::Event::Quit { .. } => return Ok(()),
+                            _ => {}
+                        }
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_millis(CONNECT_POLL_MS));
+                    elapsed += CONNECT_POLL_MS;
+
+                    connected = {
+                        let r = state.read().unwrap();
+                        r.connected
+                    };
+
+                    // small debug print every 1s
+                    if elapsed % 1000 == 0 {
+                        eprintln!("  connect wait: {}ms elapsed, connected={}", elapsed, connected);
+                    }
+                }
+
+                if connected {
+                    // success: worker connected within timeout — keep it.
+                    eprintln!("ColourSpace connected after {}ms", elapsed);
+                    break Some(state);
+                } else {
+                    // Timed out: worker never connected. Drop it and show error dialog without freezing the UI.
+                    eprintln!(
+                        "spawn_worker returned Ok but failed to connect within {}ms (last connected={})",
+                              CONNECT_TIMEOUT_MS, connected
+                    );
+
+                    // We'll spawn a thread to show the blocking message box, and use an AtomicBool
+                    // to detect when the user has dismissed it — while still polling SDL events.
+                    let dialog_done = Arc::new(AtomicBool::new(false));
+                    let dialog_done_clone = Arc::clone(&dialog_done);
+
+                    // Spawn the dialog on another thread (it will block there until user presses OK).
+                    let _dialog_thread = spawn(move || {
+                        let _ = tfd::message_box_ok(
+                            "Calibration Client Linux",
+                            "ColourSpace not reachable, check IP address",
+                            tfd::MessageBoxIcon::Error,
+                        );
+                        dialog_done_clone.store(true, Ordering::SeqCst);
+                    });
+
+                    // Wait for the dialog to be dismissed while continuing to poll SDL events.
+                    while !dialog_done.load(Ordering::SeqCst) {
+                        for evt in event_pump.poll_iter() {
+                            match evt {
+                                sdl2::event::Event::Quit { .. } => return Ok(()),
+                                _ => {}
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+
+                    // Loop will continue and re-open show_startup_ui().
+                }
+            }
+            Err(err) => {
+                eprintln!("Failed to spawn worker: {}", err);
+
+                // Show the error message non-freezing (same pattern as above)
+                let dialog_done = Arc::new(AtomicBool::new(false));
+                let dialog_done_clone = Arc::clone(&dialog_done);
+
+                let err_str = format!("ColourSpace not found\n\n{}", err);
+                let _dialog_thread = spawn(move || {
+                    let _ = tfd::message_box_ok("Calibration Client Linux", &err_str, tfd::MessageBoxIcon::Error);
+                    dialog_done_clone.store(true, Ordering::SeqCst);
+                });
+
+                while !dialog_done.load(Ordering::SeqCst) {
+                    for evt in event_pump.poll_iter() {
+                        match evt {
+                            sdl2::event::Event::Quit { .. } => return Ok(()),
+                            _ => {}
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+
+                // loop will continue and re-open show_startup_ui()
+            }
         }
     };
 
+    // Build the canvas once we have a worker (or the user cancelled earlier).
     let mut canvas = window.into_canvas().build()?;
-    let mut event_pump = sdl_context.event_pump()?;
+    // Note: we already created event_pump earlier; reuse it.
 
     // double-click detection
     let mut last_click_time = None::<Instant>;
@@ -171,10 +291,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if now.duration_since(prev) <= dc_threshold {
                             // Toggle fullscreen
                             if is_fullscreen {
-                                canvas.window_mut().set_fullscreen(sdl2::video::FullscreenType::Off).ok();
+                                canvas
+                                .window_mut()
+                                .set_fullscreen(sdl2::video::FullscreenType::Off)
+                                .ok();
                                 is_fullscreen = false;
                             } else {
-                                canvas.window_mut().set_fullscreen(sdl2::video::FullscreenType::Desktop).ok();
+                                canvas
+                                .window_mut()
+                                .set_fullscreen(sdl2::video::FullscreenType::Desktop)
+                                .ok();
                                 is_fullscreen = true;
                             }
                             last_click_time = None;
@@ -206,10 +332,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(prev) = last_click_time {
                             if now.duration_since(prev) <= dc_threshold {
                                 if is_fullscreen {
-                                    canvas.window_mut().set_fullscreen(sdl2::video::FullscreenType::Off).ok();
+                                    canvas
+                                    .window_mut()
+                                    .set_fullscreen(sdl2::video::FullscreenType::Off)
+                                    .ok();
                                     is_fullscreen = false;
                                 } else {
-                                    canvas.window_mut().set_fullscreen(sdl2::video::FullscreenType::Desktop).ok();
+                                    canvas
+                                    .window_mut()
+                                    .set_fullscreen(sdl2::video::FullscreenType::Desktop)
+                                    .ok();
                                     is_fullscreen = true;
                                 }
                                 last_click_time = None;
