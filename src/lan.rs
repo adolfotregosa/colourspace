@@ -19,6 +19,7 @@ pub struct MeasurementResult {
     pub x: Option<f64>,
     pub y: Option<f64>,
     pub y_lum: Option<f64>,
+    pub shapes: Vec<ShapeInstruction>,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +27,44 @@ pub struct MeasureRequest {
     pub red: u8,
     pub green: u8,
     pub blue: u8,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ColorRGB {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+impl ColorRGB {
+    pub fn from_components(red: u8, green: u8, blue: u8) -> Self {
+        Self { red, green, blue }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RectangleGeometry {
+    pub width: f32,
+    pub height: f32,
+    pub center_x: f32,
+    pub center_y: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct RectangleShape {
+    pub color: ColorRGB,
+    pub geometry: RectangleGeometry,
+}
+
+impl RectangleShape {
+    pub fn area(&self) -> f32 {
+        (self.geometry.width.abs()) * (self.geometry.height.abs())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ShapeInstruction {
+    Rectangle(RectangleShape),
 }
 
 pub struct ColourSpaceClient {
@@ -69,9 +108,9 @@ impl ColourSpaceClient {
         }
         let mut payload = vec![0u8; len];
         self.stream.read_exact(&mut payload)?;
-        String::from_utf8(payload)
-            .map(Some)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8 payload"))
+        String::from_utf8(payload).map(Some).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8 payload")
+        })
     }
 
     fn pretty_print_xml(xml: &str) -> Result<String, XmlError> {
@@ -263,9 +302,105 @@ impl ColourSpaceClient {
             x: None,
             y: None,
             y_lum: None,
+            shapes: Vec::new(),
         };
         let mut element_stack: Vec<String> = Vec::new();
         let mut reported_commands: HashSet<String> = HashSet::new();
+        let mut parsed_shapes: Vec<ShapeInstruction> = Vec::new();
+        #[derive(Default)]
+        struct RectangleBuilder {
+            color: Option<ColorRGB>,
+            width: Option<f32>,
+            height: Option<f32>,
+            center_x: Option<f32>,
+            center_y: Option<f32>,
+        }
+        impl RectangleBuilder {
+            fn build(self) -> Option<RectangleShape> {
+                let color = self.color?;
+                let width = self.width?;
+                let height = self.height?;
+                let center_x = self.center_x?;
+                let center_y = self.center_y?;
+                Some(RectangleShape {
+                    color,
+                    geometry: RectangleGeometry {
+                        width,
+                        height,
+                        center_x,
+                        center_y,
+                    },
+                })
+            }
+        }
+        let mut rect_builder: Option<RectangleBuilder> = None;
+        let apply_color =
+            |reader: &Reader<&[u8]>, element: &BytesStart, builder: &mut RectangleBuilder| {
+                let mut colour = builder.color.unwrap_or_default();
+                let mut updated = false;
+                for attr in element.attributes().with_checks(false) {
+                    if let Ok(attr) = attr {
+                        if let Ok(value) = attr.decode_and_unescape_value(reader) {
+                            match attr.key.as_ref() {
+                                b"red" => {
+                                    if let Ok(v) = value.parse::<u8>() {
+                                        colour.red = v;
+                                        updated = true;
+                                    }
+                                }
+                                b"green" => {
+                                    if let Ok(v) = value.parse::<u8>() {
+                                        colour.green = v;
+                                        updated = true;
+                                    }
+                                }
+                                b"blue" => {
+                                    if let Ok(v) = value.parse::<u8>() {
+                                        colour.blue = v;
+                                        updated = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if updated {
+                    builder.color = Some(colour);
+                }
+            };
+        let apply_geometry =
+            |reader: &Reader<&[u8]>, element: &BytesStart, builder: &mut RectangleBuilder| {
+                for attr in element.attributes().with_checks(false) {
+                    if let Ok(attr) = attr {
+                        if let Ok(value) = attr.decode_and_unescape_value(reader) {
+                            match attr.key.as_ref() {
+                                b"x" => {
+                                    if let Ok(v) = value.parse::<f32>() {
+                                        builder.width = Some(v);
+                                    }
+                                }
+                                b"y" => {
+                                    if let Ok(v) = value.parse::<f32>() {
+                                        builder.height = Some(v);
+                                    }
+                                }
+                                b"cx" => {
+                                    if let Ok(v) = value.parse::<f32>() {
+                                        builder.center_x = Some(v);
+                                    }
+                                }
+                                b"cy" => {
+                                    if let Ok(v) = value.parse::<f32>() {
+                                        builder.center_y = Some(v);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            };
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(e)) => {
@@ -281,14 +416,48 @@ impl ColourSpaceClient {
                     if name == "result" {
                         in_result = true;
                     }
+                    if name == "rectangle" {
+                        rect_builder = Some(RectangleBuilder::default());
+                    } else if name == "color" {
+                        if let Some(builder) = rect_builder.as_mut() {
+                            apply_color(&reader, &e, builder);
+                        }
+                    } else if name == "geometry" {
+                        if let Some(builder) = rect_builder.as_mut() {
+                            apply_geometry(&reader, &e, builder);
+                        }
+                    }
                 }
                 Ok(Event::End(e)) => {
                     if let Ok(end_name) = std::str::from_utf8(e.name().as_ref()) {
                         if end_name == "result" {
                             in_result = false;
                         }
+                        if end_name == "rectangle" {
+                            if let Some(builder) = rect_builder.take() {
+                                if let Some(rect) = builder.build() {
+                                    parsed_shapes.push(ShapeInstruction::Rectangle(rect));
+                                } else {
+                                    eprintln!(
+                                        "Received rectangle command missing required attributes"
+                                    );
+                                }
+                            }
+                        }
                     }
                     element_stack.pop();
+                }
+                Ok(Event::Empty(e)) => {
+                    let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    if name == "color" {
+                        if let Some(builder) = rect_builder.as_mut() {
+                            apply_color(&reader, &e, builder);
+                        }
+                    } else if name == "geometry" {
+                        if let Some(builder) = rect_builder.as_mut() {
+                            apply_geometry(&reader, &e, builder);
+                        }
+                    }
                 }
                 Ok(Event::Text(e)) => {
                     let raw_txt = e.unescape().unwrap_or_default().into_owned();
@@ -351,6 +520,14 @@ impl ColourSpaceClient {
             }
             buf.clear();
         }
+        if let Some(builder) = rect_builder {
+            if let Some(rect) = builder.build() {
+                parsed_shapes.push(ShapeInstruction::Rectangle(rect));
+            } else {
+                eprintln!("Received rectangle command missing required attributes");
+            }
+        }
+        res.shapes = parsed_shapes;
         Ok(res)
     }
 }
