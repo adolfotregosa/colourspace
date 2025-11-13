@@ -15,7 +15,7 @@
                     "--bin=colourspace"
                 ]
             },
-            "args": ["--remote 192.168.168.205"]
+            "args": ["--remote", "192.168.168.205"]
         },
         {
             "name": "Debug unit tests in executable 'colourspace'",

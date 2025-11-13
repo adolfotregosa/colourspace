@@ -70,11 +70,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fn draw_shapes(
         canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
         shapes: &[ShapeInstruction],
-        fallback: ColorRGB,
         width: u32,
         height: u32,
     ) {
-        let background = Color::RGB(fallback.red, fallback.green, fallback.blue);
+        let background = Color::RGB(0, 0, 0);
         canvas.set_draw_color(background);
         canvas.clear();
 
@@ -224,7 +223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 canvas.set_draw_color(Color::RGB(colour.red, colour.green, colour.blue));
                 canvas.clear();
             } else {
-                draw_shapes(&mut canvas, &shapes, current_measure_colour, width, height);
+                draw_shapes(&mut canvas, &shapes, width, height);
             }
         } else {
             let elapsed = t0.elapsed().as_secs_f32();
