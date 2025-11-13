@@ -215,8 +215,6 @@ pub struct SharedState {
     pub shapes: Vec<ShapeInstruction>,
     pub current_measure_colour: ColorRGB,
     pub request_colour: ColorRGB,
-    pub pending_commands: Vec<String>,
-    pub scene_dirty: bool,
 }
 
 impl Default for SharedState {
@@ -226,8 +224,7 @@ impl Default for SharedState {
             shapes: Vec::new(),
             current_measure_colour: ColorRGB::default(),
             request_colour: ColorRGB::default(),
-            pending_commands: Vec::new(),
-            scene_dirty: true,
+            
         }
     }
 }
@@ -517,7 +514,7 @@ pub fn spawn_worker(addr: &str) -> std::io::Result<Arc<RwLock<SharedState>>> {
     // mark it as disconnected.
     let stream_res = TcpStream::connect(&addr);
     let stream = match stream_res {
-        Ok(mut s) => {
+        Ok(s) => {
             let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
             let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
             Some(s)
@@ -541,19 +538,16 @@ pub fn spawn_worker(addr: &str) -> std::io::Result<Arc<RwLock<SharedState>>> {
                 let _ = send_xml_on_stream(&mut *guard, "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<CS_RMC version=1>\n<command>\ninit profile\n</command>\n</CS_RMC>");
             }
             loop {
-                let mut msg_opt_res = {
-                    let mut guard = match stream_recv.lock() {
-                        Ok(g) => g,
-                        Err(_) => break,
-                    };
-                    read_message_from_stream(&mut *guard)
+                let mut guard = match stream_recv.lock() {
+                    Ok(g) => g,
+                    Err(poison) => poison.into_inner(),
                 };
+                let msg_opt_res = read_message_from_stream(&mut *guard);
                 match msg_opt_res {
                     Ok(opt) => match opt {
                         Some(msg) => {
                             // To enable pretty-printed XML logging to file, uncomment this line:
                             // let _ = log_received_xml(&msg);
-                            // print xml (quick stdout preview)
 
                             // parse measurement
                             // we don't know the exact request colour here; use defaults from state
@@ -575,7 +569,6 @@ pub fn spawn_worker(addr: &str) -> std::io::Result<Arc<RwLock<SharedState>>> {
                                         w.current_measure_colour = ColorRGB::from_components(meas.red, meas.green, meas.blue);
                                         w.shapes.clear();
                                     }
-                                    w.scene_dirty = true;
                                 }
                                 Err(e) => {
                                     eprintln!("Failed to parse measurement xml: {}", e);
@@ -583,17 +576,19 @@ pub fn spawn_worker(addr: &str) -> std::io::Result<Arc<RwLock<SharedState>>> {
                             }
                         }
                         None => {
-                            // remote signalled end of communication
+                            // remote signalled end of communication (negative header)
                             let mut w = state_recv.write().unwrap();
                             w.connected = false;
-                            break;
+                            // don't break; allow retrying
+                            std::thread::sleep(Duration::from_millis(50));
                         }
                     },
                     Err(e) => {
                         eprintln!("Error reading from stream: {}", e);
                         let mut w = state_recv.write().unwrap();
                         w.connected = false;
-                        break;
+                        // transient read error: sleep briefly and retry
+                        std::thread::sleep(Duration::from_millis(50));
                     }
                 }
             }
@@ -620,32 +615,7 @@ pub fn spawn_worker(addr: &str) -> std::io::Result<Arc<RwLock<SharedState>>> {
                 if !connected {
                     // even if not connected, try to send once to establish state
                 }
-                // First, drain any pending commands and send them immediately.
-                let pending: Vec<String> = {
-                    let mut w = state_send.write().unwrap();
-                    if w.pending_commands.is_empty() {
-                        Vec::new()
-                    } else {
-                        std::mem::take(&mut w.pending_commands)
-                    }
-                };
-                if !pending.is_empty() {
-                    for cmd in pending {
-                        let send_res_cmd = {
-                            let mut guard = match stream_send.lock() {
-                                Ok(g) => g,
-                                Err(_) => break,
-                            };
-                            send_xml_on_stream(&mut *guard, &cmd)
-                        };
-                        if let Err(e) = send_res_cmd {
-                            eprintln!("Failed to send pending command: {}", e);
-                            let mut w = state_send.write().unwrap();
-                            w.connected = false;
-                            break;
-                        }
-                    }
-                }
+                // No queued commands — only send the current `request_colour`.
 
                 // compose measurement xml
                 let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<CS_RMC version=1>\n<measurement>\n<red>{}</red>\n<green>{}</green>\n<blue>{}</blue>\n</measurement>\n</CS_RMC>", r, g, b);

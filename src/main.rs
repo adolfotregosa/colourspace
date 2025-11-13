@@ -117,7 +117,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut current_measure_colour = ColorRGB::default();
     let mut shapes: Vec<ShapeInstruction> = Vec::new();
-    let mut scene_dirty = true;
 
     let mut worker: Option<std::sync::Arc<std::sync::RwLock<SharedState>>> = None;
     if let Some(addr) = remote_addr.clone() {
@@ -127,7 +126,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // sending thread sends an initial measurement immediately.
                 state.write().unwrap().request_colour = current_measure_colour;
                 worker = Some(state);
-                scene_dirty = true;
             }
             Err(e) => {
                 eprintln!("Failed to spawn ColourSpace worker for {}: {}", addr, e);
@@ -155,50 +153,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 w.request_colour = current_measure_colour;
             }
 
-                // Read and consume any pending update (clear `scene_dirty` under write lock)
-                {
-                    let mut w = state.write().unwrap();
-                    worker_disconnected = !w.connected;
-                    if w.scene_dirty {
-                        shapes = w.shapes.clone();
-                        if shapes.is_empty() {
-                            current_measure_colour = w.current_measure_colour;
-                        } else {
-                            current_measure_colour = select_measure_colour(&shapes).unwrap_or(w.current_measure_colour);
-                        }
-                        scene_dirty = true;
-                        // mark consumed
-                        w.scene_dirty = false;
-                    }
+            // Read the latest shared state each frame (no dirty flag). Use a read lock.
+            {
+                let r = state.read().unwrap();
+                worker_disconnected = !r.connected;
+                shapes = r.shapes.clone();
+                if shapes.is_empty() {
+                    current_measure_colour = r.current_measure_colour;
+                } else {
+                    current_measure_colour = select_measure_colour(&shapes).unwrap_or(r.current_measure_colour);
                 }
+            }
 
-                if worker_disconnected {
-                    // keep the worker handle (threads still own clones). Just reset the visual state until connection recovers.
-                    shapes.clear();
-                    current_measure_colour = ColorRGB::default();
-                    scene_dirty = true;
-                }
+            if worker_disconnected {
+                // keep the worker handle (threads still own clones). Just reset the visual state until connection recovers.
+                shapes.clear();
+                current_measure_colour = ColorRGB::default();
+            }
 
             if !worker_disconnected {
-                if scene_dirty {
-                    if shapes.is_empty() {
-                        let colour = current_measure_colour;
-                        canvas.set_draw_color(Color::RGB(colour.red, colour.green, colour.blue));
-                        canvas.clear();
-                    } else {
-                        draw_shapes(&mut canvas, &shapes, width, height);
-                    }
-                    canvas.present();
-                    scene_dirty = false;
-
-                    _frames += 1;
-                    if last_fps.elapsed() >= Duration::from_secs(1) {
-                        _frames = 0;
-                        last_fps = Instant::now();
-                    }
+                if shapes.is_empty() {
+                    let colour = current_measure_colour;
+                    canvas.set_draw_color(Color::RGB(colour.red, colour.green, colour.blue));
+                    canvas.clear();
                 } else {
-                    std::thread::sleep(Duration::from_millis(2));
+                    draw_shapes(&mut canvas, &shapes, width, height);
                 }
+                canvas.present();
+
+                _frames += 1;
+                if last_fps.elapsed() >= Duration::from_secs(1) {
+                    _frames = 0;
+                    last_fps = Instant::now();
+                }
+
                 continue;
             }
         }
@@ -215,7 +203,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
         canvas.clear();
         canvas.present();
-        scene_dirty = false;
 
         _frames += 1;
         if last_fps.elapsed() >= Duration::from_secs(1) {
@@ -224,7 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             last_fps = Instant::now();
         }
 
-        std::thread::sleep(Duration::from_millis(16));
+        std::thread::sleep(Duration::from_millis(8));
     }
 
     Ok(())
