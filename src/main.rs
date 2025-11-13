@@ -121,6 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_measure_sent = Instant::now();
     let mut current_measure_colour = ColorRGB::default();
     let mut shapes: Vec<ShapeInstruction> = Vec::new();
+    let mut scene_dirty = true;
 
     let mut worker: Option<(
         std::sync::mpsc::Sender<MeasureRequest>,
@@ -131,6 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok((tx, rx)) => {
                 worker = Some((tx, rx));
                 need_initial_measure = true;
+                scene_dirty = true;
             }
             Err(e) => {
                 eprintln!("Failed to spawn ColourSpace worker for {}: {}", addr, e);
@@ -151,6 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let mut worker_disconnected = false;
+        let mut received_update = false;
         if let Some((tx, rx)) = worker.as_ref() {
             loop {
                 match rx.try_recv() {
@@ -174,6 +177,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             current_measure_colour = measurement_colour;
                             shapes.clear();
                         }
+                        scene_dirty = true;
+                        received_update = true;
                         println!("Measured result: x={:?} y={:?} y_lum={:?}", x, y, y_lum);
                     }
                     Ok(Err(e)) => {
@@ -212,31 +217,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             worker = None;
             need_initial_measure = false;
             shapes.clear();
+            current_measure_colour = ColorRGB::default();
+            scene_dirty = true;
         }
 
         if worker.is_some() {
-            if shapes.is_empty() {
-                let colour = current_measure_colour;
-                canvas.set_draw_color(Color::RGB(colour.red, colour.green, colour.blue));
-                canvas.clear();
-            } else {
-                draw_shapes(&mut canvas, &shapes, width, height);
+            if scene_dirty {
+                if shapes.is_empty() {
+                    let colour = current_measure_colour;
+                    canvas.set_draw_color(Color::RGB(colour.red, colour.green, colour.blue));
+                    canvas.clear();
+                } else {
+                    draw_shapes(&mut canvas, &shapes, width, height);
+                }
+                canvas.present();
+                scene_dirty = false;
+
+                _frames += 1;
+                if last_fps.elapsed() >= Duration::from_secs(1) {
+                    //println!("FPS: {}", _frames);
+                    _frames = 0;
+                    last_fps = Instant::now();
+                }
+            } else if !received_update {
+                std::thread::sleep(Duration::from_millis(2));
             }
-        } else {
-            let elapsed = t0.elapsed().as_secs_f32();
-            let r = ((elapsed * 0.3).sin() * 0.5 + 0.5) * 255.0;
-            let g = ((elapsed * 0.5).sin() * 0.5 + 0.5) * 255.0;
-            let b = ((elapsed * 0.7).sin() * 0.5 + 0.5) * 255.0;
-            current_measure_colour = ColorRGB::from_components(r as u8, g as u8, b as u8);
-            canvas.set_draw_color(Color::RGB(
-                current_measure_colour.red,
-                current_measure_colour.green,
-                current_measure_colour.blue,
-            ));
-            canvas.clear();
+            continue;
         }
 
+        let elapsed = t0.elapsed().as_secs_f32();
+        let r = ((elapsed * 0.3).sin() * 0.5 + 0.5) * 255.0;
+        let g = ((elapsed * 0.5).sin() * 0.5 + 0.5) * 255.0;
+        let b = ((elapsed * 0.7).sin() * 0.5 + 0.5) * 255.0;
+        current_measure_colour = ColorRGB::from_components(r as u8, g as u8, b as u8);
+        canvas.set_draw_color(Color::RGB(
+            current_measure_colour.red,
+            current_measure_colour.green,
+            current_measure_colour.blue,
+        ));
+        canvas.clear();
         canvas.present();
+        scene_dirty = false;
 
         _frames += 1;
         if last_fps.elapsed() >= Duration::from_secs(1) {
