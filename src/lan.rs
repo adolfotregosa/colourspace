@@ -215,6 +215,7 @@ pub struct SharedState {
     pub shapes: Vec<ShapeInstruction>,
     pub current_measure_colour: ColorRGB,
     pub request_colour: ColorRGB,
+    pub pending_commands: Vec<String>,
     pub scene_dirty: bool,
 }
 
@@ -225,6 +226,7 @@ impl Default for SharedState {
             shapes: Vec::new(),
             current_measure_colour: ColorRGB::default(),
             request_colour: ColorRGB::default(),
+            pending_commands: Vec::new(),
             scene_dirty: true,
         }
     }
@@ -552,7 +554,7 @@ pub fn spawn_worker(addr: &str) -> std::io::Result<Arc<RwLock<SharedState>>> {
                             // To enable pretty-printed XML logging to file, uncomment this line:
                             // let _ = log_received_xml(&msg);
                             // print xml (quick stdout preview)
-                            println!("Received XML: {}", msg);
+
                             // parse measurement
                             // we don't know the exact request colour here; use defaults from state
                             let (r, g, b) = {
@@ -618,7 +620,34 @@ pub fn spawn_worker(addr: &str) -> std::io::Result<Arc<RwLock<SharedState>>> {
                 if !connected {
                     // even if not connected, try to send once to establish state
                 }
-                // compose xml
+                // First, drain any pending commands and send them immediately.
+                let pending: Vec<String> = {
+                    let mut w = state_send.write().unwrap();
+                    if w.pending_commands.is_empty() {
+                        Vec::new()
+                    } else {
+                        std::mem::take(&mut w.pending_commands)
+                    }
+                };
+                if !pending.is_empty() {
+                    for cmd in pending {
+                        let send_res_cmd = {
+                            let mut guard = match stream_send.lock() {
+                                Ok(g) => g,
+                                Err(_) => break,
+                            };
+                            send_xml_on_stream(&mut *guard, &cmd)
+                        };
+                        if let Err(e) = send_res_cmd {
+                            eprintln!("Failed to send pending command: {}", e);
+                            let mut w = state_send.write().unwrap();
+                            w.connected = false;
+                            break;
+                        }
+                    }
+                }
+
+                // compose measurement xml
                 let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<CS_RMC version=1>\n<measurement>\n<red>{}</red>\n<green>{}</green>\n<blue>{}</blue>\n</measurement>\n</CS_RMC>", r, g, b);
                 let send_res = {
                     let mut guard = match stream_send.lock() {

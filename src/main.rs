@@ -123,6 +123,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(addr) = remote_addr.clone() {
         match spawn_worker(&addr) {
             Ok(state) => {
+                // store the state and write the initial request colour so the
+                // sending thread sends an initial measurement immediately.
+                state.write().unwrap().request_colour = current_measure_colour;
                 worker = Some(state);
                 scene_dirty = true;
             }
@@ -152,27 +155,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 w.request_colour = current_measure_colour;
             }
 
-            // Read the shared shapes/measurement for drawing
-            {
-                let r = state.read().unwrap();
-                worker_disconnected = !r.connected;
-                if r.scene_dirty {
-                    shapes = r.shapes.clone();
-                    if shapes.is_empty() {
-                        current_measure_colour = r.current_measure_colour;
-                    } else {
-                        current_measure_colour = select_measure_colour(&shapes).unwrap_or(r.current_measure_colour);
+                // Read and consume any pending update (clear `scene_dirty` under write lock)
+                {
+                    let mut w = state.write().unwrap();
+                    worker_disconnected = !w.connected;
+                    if w.scene_dirty {
+                        shapes = w.shapes.clone();
+                        if shapes.is_empty() {
+                            current_measure_colour = w.current_measure_colour;
+                        } else {
+                            current_measure_colour = select_measure_colour(&shapes).unwrap_or(w.current_measure_colour);
+                        }
+                        scene_dirty = true;
+                        // mark consumed
+                        w.scene_dirty = false;
                     }
+                }
+
+                if worker_disconnected {
+                    // keep the worker handle (threads still own clones). Just reset the visual state until connection recovers.
+                    shapes.clear();
+                    current_measure_colour = ColorRGB::default();
                     scene_dirty = true;
                 }
-            }
-
-            if worker_disconnected {
-                worker = None;
-                shapes.clear();
-                current_measure_colour = ColorRGB::default();
-                scene_dirty = true;
-            }
 
             if !worker_disconnected {
                 if scene_dirty {
