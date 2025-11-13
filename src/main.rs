@@ -23,15 +23,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .vulkan() // allow Vulkan if needed later, but we use SDL2 renderer for prototype
         .build()?;
 
-    // Force desktop fullscreen
-    window.set_fullscreen(sdl2::video::FullscreenType::Desktop)?;
-
-    // Use SDL2's software renderer to fill the screen with a solid color (simple prototype)
-    let mut canvas = window.into_canvas().build()?;
-
-    let mut event_pump = sdl_context.event_pump()?;
-    let mut last_fps = Instant::now();
-    let mut _frames = 0u32;
+    // Window mode and canvas will be configured after CLI parsing so we can
+    // honor `--windowed`, `--width`, and `--height` flags.
 
     // Do NOT animate colors locally. The program must only display colours
     // provided by the server. Keep an initial colour, but never modify it
@@ -58,6 +51,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         /// pretty-print and save received XML messages
         #[argh(switch, long = "pretty-print")]
         pretty_print: bool,
+        /// run windowed instead of fullscreen
+        #[argh(switch)]
+        windowed: bool,
+        /// window width when running windowed
+        #[argh(option)]
+        width: Option<u32>,
+        /// window height when running windowed
+        #[argh(option)]
+        height: Option<u32>,
     }
 
     fn select_measure_colour(shapes: &[ShapeInstruction]) -> Option<ColorRGB> {
@@ -129,6 +131,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    // Apply windowed/size flags from CLI and then create the canvas.
+    if args.windowed {
+        let w = args.width.unwrap_or(800);
+        let h = args.height.unwrap_or(600);
+        let _ = window.set_size(w, h);
+    } else {
+        let _ = window.set_fullscreen(sdl2::video::FullscreenType::Desktop);
+    }
+
+    // Use SDL2's software renderer to fill the screen with a solid color (simple prototype)
+    let mut canvas = window.into_canvas().build()?;
+
+    let mut event_pump = sdl_context.event_pump()?;
+    let mut last_fps = Instant::now();
+    let mut _frames = 0u32;
 
     'running: loop {
         for event in event_pump.poll_iter() {
