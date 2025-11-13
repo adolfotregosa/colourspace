@@ -22,12 +22,13 @@ pub struct MeasurementResult {
     pub shapes: Vec<ShapeInstruction>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(PartialEq, Eq, Clone, Copy, Default, Debug)]
 pub struct ColorRGB {
     pub red: u8,
     pub green: u8,
     pub blue: u8,
 }
+
 
 impl ColorRGB {
     pub fn from_components(red: u8, green: u8, blue: u8) -> Self {
@@ -45,12 +46,6 @@ pub struct RectangleGeometry {
 pub struct RectangleShape {
     pub color: ColorRGB,
     pub geometry: RectangleGeometry,
-}
-
-impl RectangleShape {
-    pub fn area(&self) -> f32 {
-        (self.geometry.width.abs()) * (self.geometry.height.abs())
-    }
 }
 
 #[derive(Debug, Clone)]
