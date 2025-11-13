@@ -46,8 +46,6 @@ impl ColorRGB {
 pub struct RectangleGeometry {
     pub width: f32,
     pub height: f32,
-    pub center_x: f32,
-    pub center_y: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -312,24 +310,15 @@ impl ColourSpaceClient {
             color: Option<ColorRGB>,
             width: Option<f32>,
             height: Option<f32>,
-            center_x: Option<f32>,
-            center_y: Option<f32>,
         }
         impl RectangleBuilder {
             fn build(self) -> Option<RectangleShape> {
                 let color = self.color?;
-                let width = self.width?;
-                let height = self.height?;
-                let center_x = self.center_x?;
-                let center_y = self.center_y?;
+                let width = self.width.unwrap_or(1.0);
+                let height = self.height.unwrap_or(1.0);
                 Some(RectangleShape {
                     color,
-                    geometry: RectangleGeometry {
-                        width,
-                        height,
-                        center_x,
-                        center_y,
-                    },
+                    geometry: RectangleGeometry { width, height },
                 })
             }
         }
@@ -375,24 +364,28 @@ impl ColourSpaceClient {
                     if let Ok(attr) = attr {
                         if let Ok(value) = attr.decode_and_unescape_value(reader) {
                             match attr.key.as_ref() {
-                                b"x" => {
+                                b"cx" => {
                                     if let Ok(v) = value.parse::<f32>() {
                                         builder.width = Some(v);
                                     }
                                 }
-                                b"y" => {
+                                b"cy" => {
                                     if let Ok(v) = value.parse::<f32>() {
                                         builder.height = Some(v);
                                     }
                                 }
-                                b"cx" => {
-                                    if let Ok(v) = value.parse::<f32>() {
-                                        builder.center_x = Some(v);
+                                b"x" => {
+                                    if builder.width.is_none() {
+                                        if let Ok(v) = value.parse::<f32>() {
+                                            builder.width = Some(v);
+                                        }
                                     }
                                 }
-                                b"cy" => {
-                                    if let Ok(v) = value.parse::<f32>() {
-                                        builder.center_y = Some(v);
+                                b"y" => {
+                                    if builder.height.is_none() {
+                                        if let Ok(v) = value.parse::<f32>() {
+                                            builder.height = Some(v);
+                                        }
                                     }
                                 }
                                 _ => {}

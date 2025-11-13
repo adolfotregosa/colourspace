@@ -73,8 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         width: u32,
         height: u32,
     ) {
-        let background = Color::RGB(0, 0, 0);
-        canvas.set_draw_color(background);
+        canvas.set_draw_color(Color::RGB(0, 0, 0));
         canvas.clear();
 
         for shape in shapes {
@@ -83,15 +82,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let geom = rect.geometry;
                     let width_ratio = geom.width.clamp(0.0, 1.0);
                     let height_ratio = geom.height.clamp(0.0, 1.0);
-                    let center_x_ratio = geom.center_x.clamp(0.0, 1.0);
-                    let center_y_ratio = geom.center_y.clamp(0.0, 1.0);
 
-                    let width_px = (width_ratio * width as f32).round().max(1.0) as u32;
-                    let height_px = (height_ratio * height as f32).round().max(1.0) as u32;
-                    let cx_px = (center_x_ratio * width as f32).round() as i32;
-                    let cy_px = (center_y_ratio * height as f32).round() as i32;
-                    let left = cx_px - (width_px as i32 / 2);
-                    let top = cy_px - (height_px as i32 / 2);
+                    let width_px_f32 = (width_ratio * width as f32).clamp(1.0, width as f32);
+                    let height_px_f32 = (height_ratio * height as f32).clamp(1.0, height as f32);
+                    let width_px = width_px_f32.round() as u32;
+                    let height_px = height_px_f32.round() as u32;
+                    let left = ((width as f32 - width_px_f32) / 2.0).round() as i32;
+                    let top = ((height as f32 - height_px_f32) / 2.0).round() as i32;
 
                     let draw_color = Color::RGB(rect.color.red, rect.color.green, rect.color.blue);
                     canvas.set_draw_color(draw_color);
