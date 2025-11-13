@@ -383,8 +383,8 @@ fn parse_measurement_from_xml(xml: &str, r: u8, g: u8, b: u8) -> Result<Measurem
                 element_stack.push(name.clone());
                 if element_stack.len() == 2 {
                     let command = element_stack[1].clone();
-                    if reported_commands.insert(command.clone()) {
-                        println!("Received command: {}", command);
+                    if !reported_commands.insert(command.clone()) {
+                        panic!("Received command: {} was not satisfied", command);
                     }
                 }
                 cur_elem = name.clone();
@@ -413,7 +413,7 @@ fn parse_measurement_from_xml(xml: &str, r: u8, g: u8, b: u8) -> Result<Measurem
                             if let Some(rect) = builder.build() {
                                 parsed_shapes.push(ShapeInstruction::Rectangle(rect));
                             } else {
-                                eprintln!("Received rectangle command missing required attributes");
+                                panic!("Received rectangle command missing required attributes");
                             }
                         }
                     }
@@ -494,7 +494,7 @@ fn parse_measurement_from_xml(xml: &str, r: u8, g: u8, b: u8) -> Result<Measurem
         if let Some(rect) = builder.build() {
             parsed_shapes.push(ShapeInstruction::Rectangle(rect));
         } else {
-            eprintln!("Received rectangle command missing required attributes");
+            panic!("Received rectangle command missing required attributes");
         }
     }
     res.shapes = parsed_shapes;
@@ -516,8 +516,11 @@ pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLoc
     let stream_res = TcpStream::connect(&addr);
     let stream = match stream_res {
         Ok(s) => {
-            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
-            let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+            // Keep the stream in blocking mode so the receiving thread will
+            // block on `read_exact` until data arrives. Timeouts cause
+            // spurious `Err` results when the server is idle, which would
+            // incorrectly set `connected = false` and make the screen go
+            // black. Don't set read/write timeouts here.
             Some(s)
         }
         Err(e) => {
@@ -589,7 +592,7 @@ pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLoc
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("Failed to parse measurement xml: {}", e);
+                                    panic!("Failed to parse measurement xml: {}", e);
                                 }
                             }
                         }
