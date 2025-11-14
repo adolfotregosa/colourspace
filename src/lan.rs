@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -28,7 +28,6 @@ pub struct ColorRGB {
     pub green: u8,
     pub blue: u8,
 }
-
 
 impl ColorRGB {
     pub fn from_components(red: u8, green: u8, blue: u8) -> Self {
@@ -187,15 +186,15 @@ fn log_received_xml(xml: &str) -> std::io::Result<()> {
     };
 
     let log_path = std::env::var("COLOURSPACE_XML_LOG")
-        .unwrap_or_else(|_| "colourspace_commands.log".to_string());
+    .unwrap_or_else(|_| "colourspace_commands.log".to_string());
     let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    .create(true)
+    .append(true)
+    .open(&log_path)?;
     let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
+    .duration_since(UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_secs_f64();
     writeln!(file, "----- Received at {:.3} -----", timestamp)?;
     file.write_all(pretty.as_bytes())?;
     if !pretty.ends_with('\n') {
@@ -256,8 +255,8 @@ fn read_message_from_stream(stream: &mut TcpStream) -> std::io::Result<Option<St
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload)?;
     String::from_utf8(payload)
-        .map(Some)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8 payload"))
+    .map(Some)
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid utf8 payload"))
 }
 
 /// Parse XML string into a MeasurementResult. The `r,g,b` parameters are the
@@ -300,76 +299,76 @@ fn parse_measurement_from_xml(xml: &str, r: u8, g: u8, b: u8) -> Result<Measurem
     }
     let mut rect_builder: Option<RectangleBuilder> = None;
     let apply_color =
-        |reader: &Reader<&[u8]>, element: &BytesStart, builder: &mut RectangleBuilder| {
-            let mut colour = builder.color.unwrap_or_default();
-            let mut updated = false;
-            for attr in element.attributes().with_checks(false) {
-                if let Ok(attr) = attr {
-                    if let Ok(value) = attr.decode_and_unescape_value(reader) {
-                        match attr.key.as_ref() {
-                            b"red" => {
-                                if let Ok(v) = value.parse::<u8>() {
-                                    colour.red = v;
-                                    updated = true;
-                                }
+    |reader: &Reader<&[u8]>, element: &BytesStart, builder: &mut RectangleBuilder| {
+        let mut colour = builder.color.unwrap_or_default();
+        let mut updated = false;
+        for attr in element.attributes().with_checks(false) {
+            if let Ok(attr) = attr {
+                if let Ok(value) = attr.decode_and_unescape_value(reader) {
+                    match attr.key.as_ref() {
+                        b"red" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                colour.red = v;
+                                updated = true;
                             }
-                            b"green" => {
-                                if let Ok(v) = value.parse::<u8>() {
-                                    colour.green = v;
-                                    updated = true;
-                                }
-                            }
-                            b"blue" => {
-                                if let Ok(v) = value.parse::<u8>() {
-                                    colour.blue = v;
-                                    updated = true;
-                                }
-                            }
-                            _ => {}
                         }
+                        b"green" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                colour.green = v;
+                                updated = true;
+                            }
+                        }
+                        b"blue" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                colour.blue = v;
+                                updated = true;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
-            if updated {
-                builder.color = Some(colour);
-            }
-        };
+        }
+        if updated {
+            builder.color = Some(colour);
+        }
+    };
     let apply_geometry =
-        |reader: &Reader<&[u8]>, element: &BytesStart, builder: &mut RectangleBuilder| {
-            for attr in element.attributes().with_checks(false) {
-                if let Ok(attr) = attr {
-                    if let Ok(value) = attr.decode_and_unescape_value(reader) {
-                        match attr.key.as_ref() {
-                            b"cx" => {
+    |reader: &Reader<&[u8]>, element: &BytesStart, builder: &mut RectangleBuilder| {
+        for attr in element.attributes().with_checks(false) {
+            if let Ok(attr) = attr {
+                if let Ok(value) = attr.decode_and_unescape_value(reader) {
+                    match attr.key.as_ref() {
+                        b"cx" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                builder.width = Some(v);
+                            }
+                        }
+                        b"cy" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                builder.height = Some(v);
+                            }
+                        }
+                        b"x" => {
+                            if builder.width.is_none() {
                                 if let Ok(v) = value.parse::<f32>() {
                                     builder.width = Some(v);
                                 }
                             }
-                            b"cy" => {
+                        }
+                        b"y" => {
+                            if builder.height.is_none() {
                                 if let Ok(v) = value.parse::<f32>() {
                                     builder.height = Some(v);
                                 }
                             }
-                            b"x" => {
-                                if builder.width.is_none() {
-                                    if let Ok(v) = value.parse::<f32>() {
-                                        builder.width = Some(v);
-                                    }
-                                }
-                            }
-                            b"y" => {
-                                if builder.height.is_none() {
-                                    if let Ok(v) = value.parse::<f32>() {
-                                        builder.height = Some(v);
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
+                        _ => {}
                     }
                 }
             }
-        };
+        }
+    };
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -496,6 +495,29 @@ fn parse_measurement_from_xml(xml: &str, r: u8, g: u8, b: u8) -> Result<Measurem
     Ok(res)
 }
 
+/// Connect to an address string like "192.168.168.11:20002" with a short timeout.
+/// Tries all resolved socket addrs and returns the first successful TcpStream.
+fn connect_with_timeout(addr_str: &str, timeout: Duration) -> std::io::Result<TcpStream> {
+    let addrs = addr_str.to_socket_addrs()?;
+    let mut last_err: Option<std::io::Error> = None;
+
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(stream) => {
+                // Keep the stream in blocking mode — the receiving thread expects blocking.
+                return Ok(stream);
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "no socket addresses found")
+    }))
+}
+
 /// Spawn a background worker thread that keeps a connection and performs measurements.
 /// Returns (request_sender, response_receiver).
 /// Spawn two background threads: a receiving thread that blocks on
@@ -506,9 +528,10 @@ fn parse_measurement_from_xml(xml: &str, r: u8, g: u8, b: u8) -> Result<Measurem
 /// thread) can use to read the current shapes and measured colour.
 pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLock<SharedState>>> {
     let addr = addr.to_owned();
-    // Try to connect immediately; if connection fails, still return state but
-    // mark it as disconnected.
-    let stream_res = TcpStream::connect(&addr);
+    // Try to connect immediately with a short timeout; if connection fails,
+    // still return state but mark it as disconnected.
+    const CONNECT_TIMEOUT_MS: u64 = 500; // adjust to taste (200..1000ms recommended)
+    let stream_res = connect_with_timeout(&addr, Duration::from_millis(CONNECT_TIMEOUT_MS));
     let stream = match stream_res {
         Ok(s) => {
             // Keep the stream in blocking mode so the receiving thread will
@@ -520,6 +543,8 @@ pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLoc
         }
         Err(e) => {
             eprintln!("Failed to connect to {}: {}", addr, e);
+            // ensure immediate output
+            let _ = std::io::stderr().flush();
             None
         }
     };
@@ -542,7 +567,7 @@ pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLoc
             loop {
                 let mut guard = match stream_recv.lock() {
                     Ok(g) => g,
-                    Err(poison) => poison.into_inner(),
+                      Err(poison) => poison.into_inner(),
                 };
                 let msg_opt_res = read_message_from_stream(&mut *guard);
                 match msg_opt_res {
@@ -559,8 +584,8 @@ pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLoc
                                 let rguard = state_recv.read().unwrap();
                                 (
                                     rguard.request_colour.red,
-                                    rguard.request_colour.green,
-                                    rguard.request_colour.blue,
+                                 rguard.request_colour.green,
+                                 rguard.request_colour.blue,
                                 )
                             };
                             match parse_measurement_from_xml(&msg, r, g, b) {
@@ -570,14 +595,14 @@ pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLoc
                                     if !meas.shapes.is_empty() {
                                         // choose shape colour logic is done in drawing side; we just store shapes
                                         w.current_measure_colour = meas
-                                            .shapes
-                                            .get(0)
-                                            .map(|s| match s {
-                                                ShapeInstruction::Rectangle(r) => r.color,
-                                            })
-                                            .unwrap_or(ColorRGB::from_components(
-                                                meas.red, meas.green, meas.blue,
-                                            ));
+                                        .shapes
+                                        .get(0)
+                                        .map(|s| match s {
+                                            ShapeInstruction::Rectangle(r) => r.color,
+                                        })
+                                        .unwrap_or(ColorRGB::from_components(
+                                            meas.red, meas.green, meas.blue,
+                                        ));
                                         w.shapes = meas.shapes;
                                     } else {
                                         w.current_measure_colour = ColorRGB::from_components(
@@ -623,9 +648,9 @@ pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLoc
                     let rguard = state_send.read().unwrap();
                     (
                         rguard.request_colour.red,
-                        rguard.request_colour.green,
-                        rguard.request_colour.blue,
-                        rguard.connected,
+                     rguard.request_colour.green,
+                     rguard.request_colour.blue,
+                     rguard.connected,
                     )
                 };
                 if !connected {
@@ -641,7 +666,7 @@ pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLoc
                 let send_res = {
                     let mut guard = match stream_send.lock() {
                         Ok(g) => g,
-                        Err(_) => break,
+                      Err(_) => break,
                     };
                     send_xml_on_stream(&mut *guard, &xml)
                 };
