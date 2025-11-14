@@ -131,8 +131,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut current_measure_colour = ColorRGB::default();
     let mut maybe_remote = args.remote;
 
-    // Increased timeout to 5000ms to give slower setups time to connect.
-    const CONNECT_TIMEOUT_MS: u64 = 5000;
+    // Increased timeout to 6000ms to give slower setups time to connect.
+    const CONNECT_TIMEOUT_MS: u64 = 6000;
     const CONNECT_POLL_MS: u64 = 50;
 
     // The loop yields Some(worker_state) when we have a worker that successfully connected.
