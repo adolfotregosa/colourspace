@@ -85,6 +85,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|(_, color)| color)
     }
 
+    /// Helper: convert a `ColorRGB` (u16 + depth_bits) into an 8-bit RGB tuple.
+    ///
+    /// Note: this is intentionally local to `main.rs` so the `lan` module stays
+    /// depth-agnostic. When you add a Vulkan 10-bit pipeline, replace or extend
+    /// this helper to return higher-bit buffers or skip the conversion entirely.
+    fn color_to_u8_tuple(color: ColorRGB) -> (u8, u8, u8) {
+        let bits = if color.depth_bits == 0 { 8 } else { color.depth_bits };
+        let max_in: u32 = if bits >= 16 {
+            0xFFFF
+        } else {
+            (1u32 << bits as u32) - 1
+        };
+
+        // avoid division by zero (defensive)
+        let max_in = if max_in == 0 { 255 } else { max_in };
+
+        let r = ((color.red as u32 * 255 + max_in / 2) / max_in) as u8;
+        let g = ((color.green as u32 * 255 + max_in / 2) / max_in) as u8;
+        let b = ((color.blue as u32 * 255 + max_in / 2) / max_in) as u8;
+        (r, g, b)
+    }
+
     fn draw_shapes(
         canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
         shapes: &[ShapeInstruction],
@@ -106,7 +128,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let top = ((h as f32 - rh as f32) / 2.0).round() as i32;
 
                     let color = rect.color;
-                    let (r8, g8, b8) = color.to_u8_tuple(); // downscale from u16/depth to u8
+                    // downscale from u16/depth to u8 here using local helper
+                    let (r8, g8, b8) = color_to_u8_tuple(color);
                     canvas.set_draw_color(Color::RGB(r8, g8, b8));
                     let _ = canvas.fill_rect(Rect::new(left, top, rw, rh));
                 }
@@ -388,7 +411,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             draw_shapes(&mut canvas, &shapes, cw, ch);
         } else {
             let c = current_measure_colour;
-            let (r8, g8, b8) = c.to_u8_tuple(); // downscale before giving to SDL
+            // downscale before giving to SDL using the helper
+            let (r8, g8, b8) = color_to_u8_tuple(c);
             canvas.set_draw_color(Color::RGB(r8, g8, b8));
             canvas.clear();
         }

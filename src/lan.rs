@@ -1,3 +1,4 @@
+// === lan.rs (updated) ===
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -56,23 +57,9 @@ impl ColorRGB {
         }
     }
 
-    /// Convert to 8-bit tuple by integer scaling (naive). Good enough for SDL fallback.
-    pub fn to_u8_tuple(self) -> (u8, u8, u8) {
-        let bits = if self.depth_bits == 0 { 8 } else { self.depth_bits };
-        let max_in: u32 = if bits >= 16 {
-            0xFFFF
-        } else {
-            (1u32 << bits as u32) - 1
-        };
-
-        // avoid division by zero
-        let max_in = if max_in == 0 { 255 } else { max_in };
-
-        let r = ((self.red as u32 * 255 + max_in / 2) / max_in) as u8;
-        let g = ((self.green as u32 * 255 + max_in / 2) / max_in) as u8;
-        let b = ((self.blue as u32 * 255 + max_in / 2) / max_in) as u8;
-        (r, g, b)
-    }
+    // NOTE: to_u8_tuple removed — color downscaling should be done by the
+    // consumer (e.g. main.rs) so lan.rs stays depth-agnostic and can be used
+    // for future 10/12-bit rendering paths.
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -692,4 +679,3 @@ pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLoc
 
     Ok(state)
 }
-
