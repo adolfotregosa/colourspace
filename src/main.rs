@@ -106,7 +106,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let top = ((h as f32 - rh as f32) / 2.0).round() as i32;
 
                     let color = rect.color;
-                    canvas.set_draw_color(Color::RGB(color.red, color.green, color.blue));
+                    let (r8, g8, b8) = color.to_u8_tuple(); // downscale from u16/depth to u8
+                    canvas.set_draw_color(Color::RGB(r8, g8, b8));
                     let _ = canvas.fill_rect(Rect::new(left, top, rw, rh));
                 }
             }
@@ -387,7 +388,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             draw_shapes(&mut canvas, &shapes, cw, ch);
         } else {
             let c = current_measure_colour;
-            canvas.set_draw_color(Color::RGB(c.red, c.green, c.blue));
+            let (r8, g8, b8) = c.to_u8_tuple(); // downscale before giving to SDL
+            canvas.set_draw_color(Color::RGB(r8, g8, b8));
             canvas.clear();
         }
 

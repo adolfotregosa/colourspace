@@ -13,25 +13,65 @@ use quick_xml::events::{BytesStart, BytesText, Event as XmlEvent};
 
 #[derive(Debug, Clone)]
 pub struct MeasurementResult {
-    pub red: u8,
-    pub green: u8,
-    pub blue: u8,
+    // store as u16 so we can carry 10/12/16-bit values
+    pub red: u16,
+    pub green: u16,
+    pub blue: u16,
     pub x: Option<f64>,
     pub y: Option<f64>,
     pub y_lum: Option<f64>,
     pub shapes: Vec<ShapeInstruction>,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy, Default, Debug)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub struct ColorRGB {
-    pub red: u8,
-    pub green: u8,
-    pub blue: u8,
+    // allow storage up to 16-bit per channel
+    pub red: u16,
+    pub green: u16,
+    pub blue: u16,
+    // how many bits per channel the source values represent (8,10,12,16...)
+    pub depth_bits: u8,
+}
+
+impl Default for ColorRGB {
+    fn default() -> Self {
+        Self {
+            red: 0,
+            green: 0,
+            blue: 0,
+            depth_bits: 8,
+        }
+    }
 }
 
 impl ColorRGB {
-    pub fn from_components(red: u8, green: u8, blue: u8) -> Self {
-        Self { red, green, blue }
+
+    pub fn from_components_u16(red: u16, green: u16, blue: u16, bits: u8) -> Self {
+        let bits = if bits == 0 { 8 } else { bits };
+        Self {
+            red,
+            green,
+            blue,
+            depth_bits: bits,
+        }
+    }
+
+    /// Convert to 8-bit tuple by integer scaling (naive). Good enough for SDL fallback.
+    pub fn to_u8_tuple(self) -> (u8, u8, u8) {
+        let bits = if self.depth_bits == 0 { 8 } else { self.depth_bits };
+        let max_in: u32 = if bits >= 16 {
+            0xFFFF
+        } else {
+            (1u32 << bits as u32) - 1
+        };
+
+        // avoid division by zero
+        let max_in = if max_in == 0 { 255 } else { max_in };
+
+        let r = ((self.red as u32 * 255 + max_in / 2) / max_in) as u8;
+        let g = ((self.green as u32 * 255 + max_in / 2) / max_in) as u8;
+        let b = ((self.blue as u32 * 255 + max_in / 2) / max_in) as u8;
+        (r, g, b)
     }
 }
 
@@ -191,7 +231,8 @@ fn log_received_xml(xml: &str) -> std::io::Result<()> {
     .create(true)
     .append(true)
     .open(&log_path)?;
-    let timestamp = SystemTime::now()
+    let timestamp =
+    SystemTime::now()
     .duration_since(UNIX_EPOCH)
     .unwrap_or_default()
     .as_secs_f64();
@@ -261,8 +302,8 @@ fn read_message_from_stream(stream: &mut TcpStream) -> std::io::Result<Option<St
 
 /// Parse XML string into a MeasurementResult. The `r,g,b` parameters are the
 /// requested components that will be used as fallback initial values in the
-/// result (keeps previous behavior).
-fn parse_measurement_from_xml(xml: &str, r: u8, g: u8, b: u8) -> Result<MeasurementResult, String> {
+/// result (keeps previous behavior). These are now u16 to allow >8-bit defaults.
+fn parse_measurement_from_xml(xml: &str, r: u16, g: u16, b: u16) -> Result<MeasurementResult, String> {
     let mut reader = Reader::from_str(xml);
     reader.trim_text(true);
     let mut buf = Vec::new();
@@ -280,6 +321,7 @@ fn parse_measurement_from_xml(xml: &str, r: u8, g: u8, b: u8) -> Result<Measurem
     let mut element_stack: Vec<String> = Vec::new();
     let mut reported_commands: HashSet<String> = HashSet::new();
     let mut parsed_shapes: Vec<ShapeInstruction> = Vec::new();
+
     #[derive(Default)]
     struct RectangleBuilder {
         color: Option<ColorRGB>,
@@ -298,29 +340,46 @@ fn parse_measurement_from_xml(xml: &str, r: u8, g: u8, b: u8) -> Result<Measurem
         }
     }
     let mut rect_builder: Option<RectangleBuilder> = None;
+
+    // apply_color now understands "bits" attribute and larger numeric values
     let apply_color =
     |reader: &Reader<&[u8]>, element: &BytesStart, builder: &mut RectangleBuilder| {
         let mut colour = builder.color.unwrap_or_default();
         let mut updated = false;
+        // check for an optional bits attribute on this color element and parse numeric values as u16
         for attr in element.attributes().with_checks(false) {
             if let Ok(attr) = attr {
                 if let Ok(value) = attr.decode_and_unescape_value(reader) {
                     match attr.key.as_ref() {
-                        b"red" => {
+                        b"bits" | b"depth" | b"bitDepth" => {
                             if let Ok(v) = value.parse::<u8>() {
+                                colour.depth_bits = v;
+                            }
+                        }
+                        b"red" => {
+                            if let Ok(v) = value.parse::<u16>() {
                                 colour.red = v;
+                                updated = true;
+                            } else if let Ok(v8) = value.parse::<u8>() {
+                                colour.red = v8 as u16;
                                 updated = true;
                             }
                         }
                         b"green" => {
-                            if let Ok(v) = value.parse::<u8>() {
+                            if let Ok(v) = value.parse::<u16>() {
                                 colour.green = v;
+                                updated = true;
+                            } else if let Ok(v8) = value.parse::<u8>() {
+                                colour.green = v8 as u16;
                                 updated = true;
                             }
                         }
                         b"blue" => {
-                            if let Ok(v) = value.parse::<u8>() {
+                            if let Ok(v) = value.parse::<u16>() {
                                 colour.blue = v;
+                                updated = true;
+                            } else if let Ok(v8) = value.parse::<u8>() {
+                                colour.blue = v8 as u16;
                                 updated = true;
                             }
                         }
@@ -333,6 +392,7 @@ fn parse_measurement_from_xml(xml: &str, r: u8, g: u8, b: u8) -> Result<Measurem
             builder.color = Some(colour);
         }
     };
+
     let apply_geometry =
     |reader: &Reader<&[u8]>, element: &BytesStart, builder: &mut RectangleBuilder| {
         for attr in element.attributes().with_checks(false) {
@@ -387,7 +447,7 @@ fn parse_measurement_from_xml(xml: &str, r: u8, g: u8, b: u8) -> Result<Measurem
                 }
                 if name == "rectangle" {
                     rect_builder = Some(RectangleBuilder::default());
-                } else if name == "color" {
+                } else if name == "color" || name == "colex" {
                     if let Some(builder) = rect_builder.as_mut() {
                         apply_color(&reader, &e, builder);
                     }
@@ -416,7 +476,7 @@ fn parse_measurement_from_xml(xml: &str, r: u8, g: u8, b: u8) -> Result<Measurem
             }
             Ok(Event::Empty(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if name == "color" {
+                if name == "color" || name == "colex" {
                     if let Some(builder) = rect_builder.as_mut() {
                         apply_color(&reader, &e, builder);
                     }
@@ -444,18 +504,24 @@ fn parse_measurement_from_xml(xml: &str, r: u8, g: u8, b: u8) -> Result<Measurem
                 }
                 match cur_elem.as_str() {
                     "red" => {
-                        if let Ok(v) = txt_trimmed.parse::<u8>() {
+                        if let Ok(v) = txt_trimmed.parse::<u16>() {
                             res.red = v
+                        } else if let Ok(v8) = txt_trimmed.parse::<u8>() {
+                            res.red = v8 as u16;
                         }
                     }
                     "green" => {
-                        if let Ok(v) = txt_trimmed.parse::<u8>() {
+                        if let Ok(v) = txt_trimmed.parse::<u16>() {
                             res.green = v
+                        } else if let Ok(v8) = txt_trimmed.parse::<u8>() {
+                            res.green = v8 as u16;
                         }
                     }
                     "blue" => {
-                        if let Ok(v) = txt_trimmed.parse::<u8>() {
+                        if let Ok(v) = txt_trimmed.parse::<u16>() {
                             res.blue = v
+                        } else if let Ok(v8) = txt_trimmed.parse::<u8>() {
+                            res.blue = v8 as u16;
                         }
                     }
                     "x" => {
@@ -520,12 +586,11 @@ fn connect_with_timeout(addr_str: &str, timeout: Duration) -> std::io::Result<Tc
 
 /// Spawn a background worker thread that keeps a connection and performs measurements.
 /// Returns (request_sender, response_receiver).
-/// Spawn two background threads: a receiving thread that blocks on
-/// `read_exact` (uses `read_message_from_stream`) and updates the shared state
-/// under an `RwLock`, and a sending thread that periodically reads the
-/// requested colour from the shared state and writes measurement requests to
-/// the stream. Returns an `Arc<RwLock<SharedState>>` that the caller (drawing
-/// thread) can use to read the current shapes and measured colour.
+/// Spawn two background threads: a receiving thread that blocks on read_exact
+/// (uses `read_message_from_stream`) and updates the shared state under an `RwLock`,
+/// and a sending thread that periodically reads the requested colour from the shared state
+/// and writes measurement requests to the stream. Returns an `Arc<RwLock<SharedState>>` that
+/// the caller (drawing thread) can use to read the current shapes and measured colour.
 pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLock<SharedState>>> {
     let addr = addr.to_owned();
     // Try to connect immediately with a short timeout; if connection fails,
@@ -600,13 +665,13 @@ pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLoc
                                         .map(|s| match s {
                                             ShapeInstruction::Rectangle(r) => r.color,
                                         })
-                                        .unwrap_or(ColorRGB::from_components(
-                                            meas.red, meas.green, meas.blue,
+                                        .unwrap_or(ColorRGB::from_components_u16(
+                                            meas.red, meas.green, meas.blue, 8,
                                         ));
                                         w.shapes = meas.shapes;
                                     } else {
-                                        w.current_measure_colour = ColorRGB::from_components(
-                                            meas.red, meas.green, meas.blue,
+                                        w.current_measure_colour = ColorRGB::from_components_u16(
+                                            meas.red, meas.green, meas.blue, 8,
                                         );
                                         w.shapes.clear();
                                     }
@@ -644,12 +709,10 @@ pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLoc
             let measurement_interval = Duration::from_secs(1);
             loop {
                 // read desired request colour
-                let (r, g, b, connected) = {
+                let (rc, connected) = {
                     let rguard = state_send.read().unwrap();
                     (
-                        rguard.request_colour.red,
-                     rguard.request_colour.green,
-                     rguard.request_colour.blue,
+                        rguard.request_colour,
                      rguard.connected,
                     )
                 };
@@ -657,11 +720,14 @@ pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLoc
                     // even if not connected, try to send once to establish state
                 }
                 // No queued commands — only send the current `request_colour`.
+                // The network protocol historically expects 8-bit measurement requests,
+                // so downscale the request colour to 8-bit when sending XML.
+                let (r8, g8, b8) = rc.to_u8_tuple();
 
                 // compose measurement xml
                 let xml = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<CS_RMC version=1>\n<measurement>\n<red>{}</red>\n<green>{}</green>\n<blue>{}</blue>\n</measurement>\n</CS_RMC>",
-                    r, g, b
+                    r8, g8, b8
                 );
                 let send_res = {
                     let mut guard = match stream_send.lock() {
