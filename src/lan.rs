@@ -593,22 +593,13 @@ fn connect_with_timeout(addr_str: &str, timeout: Duration) -> std::io::Result<Tc
 /// the caller (drawing thread) can use to read the current shapes and measured colour.
 pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLock<SharedState>>> {
     let addr = addr.to_owned();
-    // Try to connect immediately with a short timeout; if connection fails,
-    // still return state but mark it as disconnected.
-    const CONNECT_TIMEOUT_MS: u64 = 500; // adjust to taste (200..1000ms recommended)
+
+    const CONNECT_TIMEOUT_MS: u64 = 500;
     let stream_res = connect_with_timeout(&addr, Duration::from_millis(CONNECT_TIMEOUT_MS));
     let stream = match stream_res {
-        Ok(s) => {
-            // Keep the stream in blocking mode so the receiving thread will
-            // block on `read_exact` until data arrives. Timeouts cause
-            // spurious `Err` results when the server is idle, which would
-            // incorrectly set `connected = false` and make the screen go
-            // black. Don't set read/write timeouts here.
-            Some(s)
-        }
+        Ok(s) => Some(s),
         Err(e) => {
             eprintln!("Failed to connect to {}: {}", addr, e);
-            // ensure immediate output
             let _ = std::io::stderr().flush();
             None
         }
@@ -616,139 +607,89 @@ pub fn spawn_worker(addr: &str, pretty_print: bool) -> std::io::Result<Arc<RwLoc
 
     let state = Arc::new(RwLock::new(SharedState::default()));
 
+    // If connection succeeded, spawn ONLY the receiving thread.
     if let Some(s) = stream {
         let stream_arc = Arc::new(Mutex::new(s));
         let state_recv = state.clone();
         let stream_recv = stream_arc.clone();
-        // Receiving thread: blocks on read_exact as requested
+
         thread::spawn(move || {
-            // initialize profile
+            // Send init profile (one-off mandatory handshake)
             if let Ok(mut guard) = stream_recv.lock() {
                 let _ = send_xml_on_stream(
                     &mut *guard,
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<CS_RMC version=1>\n<command>\ninit profile\n</command>\n</CS_RMC>",
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\
+<CS_RMC version=1><command>init profile</command></CS_RMC>",
                 );
             }
+
             loop {
                 let mut guard = match stream_recv.lock() {
                     Ok(g) => g,
                       Err(poison) => poison.into_inner(),
                 };
-                let msg_opt_res = read_message_from_stream(&mut *guard);
-                match msg_opt_res {
-                    Ok(opt) => match opt {
-                        Some(msg) => {
-                            // Pretty-printing/logging if requested by CLI flag
-                            if pretty_print {
-                                let _ = log_received_xml(&msg);
-                            }
 
-                            // parse measurement
-                            // we don't know the exact request colour here; use defaults from state
-                            let (r, g, b) = {
-                                let rguard = state_recv.read().unwrap();
-                                (
-                                    rguard.request_colour.red,
-                                 rguard.request_colour.green,
-                                 rguard.request_colour.blue,
-                                )
-                            };
-                            match parse_measurement_from_xml(&msg, r, g, b) {
-                                Ok(meas) => {
-                                    let mut w = state_recv.write().unwrap();
-                                    w.connected = true;
-                                    if !meas.shapes.is_empty() {
-                                        // choose shape colour logic is done in drawing side; we just store shapes
-                                        w.current_measure_colour = meas
-                                        .shapes
-                                        .get(0)
-                                        .map(|s| match s {
-                                            ShapeInstruction::Rectangle(r) => r.color,
-                                        })
-                                        .unwrap_or(ColorRGB::from_components_u16(
-                                            meas.red, meas.green, meas.blue, 8,
-                                        ));
-                                        w.shapes = meas.shapes;
-                                    } else {
-                                        w.current_measure_colour = ColorRGB::from_components_u16(
-                                            meas.red, meas.green, meas.blue, 8,
-                                        );
-                                        w.shapes.clear();
-                                    }
-                                }
-                                Err(e) => {
-                                    panic!("Failed to parse measurement xml: {}", e);
+                let msg_opt_res = read_message_from_stream(&mut *guard);
+
+                match msg_opt_res {
+                    Ok(Some(msg)) => {
+                        if pretty_print {
+                            let _ = log_received_xml(&msg);
+                        }
+
+                        let (r, g, b) = {
+                            let rguard = state_recv.read().unwrap();
+                            (
+                                rguard.request_colour.red,
+                             rguard.request_colour.green,
+                             rguard.request_colour.blue,
+                            )
+                        };
+
+                        match parse_measurement_from_xml(&msg, r, g, b) {
+                            Ok(meas) => {
+                                let mut w = state_recv.write().unwrap();
+                                w.connected = true;
+
+                                if !meas.shapes.is_empty() {
+                                    w.current_measure_colour = meas
+                                    .shapes
+                                    .get(0)
+                                    .map(|s| match s {
+                                        ShapeInstruction::Rectangle(r) => r.color,
+                                    })
+                                    .unwrap_or(ColorRGB::from_components_u16(
+                                        meas.red, meas.green, meas.blue, 8,
+                                    ));
+                                    w.shapes = meas.shapes;
+                                } else {
+                                    w.current_measure_colour = ColorRGB::from_components_u16(
+                                        meas.red, meas.green, meas.blue, 8,
+                                    );
+                                    w.shapes.clear();
                                 }
                             }
+                            Err(e) => panic!("Failed to parse measurement xml: {}", e),
                         }
-                        None => {
-                            // remote signalled end of communication (negative header)
-                            let mut w = state_recv.write().unwrap();
-                            w.connected = false;
-                            // don't break; allow retrying
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
-                    },
+                    }
+
+                    Ok(None) => {
+                        let mut w = state_recv.write().unwrap();
+                        w.connected = false;
+                        thread::sleep(Duration::from_millis(50));
+                    }
+
                     Err(e) => {
                         eprintln!("Error reading from stream: {}", e);
                         let mut w = state_recv.write().unwrap();
                         w.connected = false;
-                        // transient read error: sleep briefly and retry
-                        std::thread::sleep(Duration::from_millis(50));
+                        thread::sleep(Duration::from_millis(50));
                     }
                 }
-            }
-        });
-
-        // Sending thread: periodically sends measurement requests based on the
-        // `request_colour` in `state`. It runs independently so it won't stall
-        // drawing.
-        let state_send = state.clone();
-        let stream_send = stream_arc.clone();
-        thread::spawn(move || {
-            let measurement_interval = Duration::from_secs(1);
-            loop {
-                // read desired request colour
-                let (rc, connected) = {
-                    let rguard = state_send.read().unwrap();
-                    (
-                        rguard.request_colour,
-                     rguard.connected,
-                    )
-                };
-                if !connected {
-                    // even if not connected, try to send once to establish state
-                }
-                // No queued commands — only send the current `request_colour`.
-                // The network protocol historically expects 8-bit measurement requests,
-                // so downscale the request colour to 8-bit when sending XML.
-                let (r8, g8, b8) = rc.to_u8_tuple();
-
-                // compose measurement xml
-                let xml = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<CS_RMC version=1>\n<measurement>\n<red>{}</red>\n<green>{}</green>\n<blue>{}</blue>\n</measurement>\n</CS_RMC>",
-                    r8, g8, b8
-                );
-                let send_res = {
-                    let mut guard = match stream_send.lock() {
-                        Ok(g) => g,
-                      Err(_) => break,
-                    };
-                    send_xml_on_stream(&mut *guard, &xml)
-                };
-                if let Err(e) = send_res {
-                    eprintln!("Failed to send measurement request: {}", e);
-                    let mut w = state_send.write().unwrap();
-                    w.connected = false;
-                    break;
-                } else {
-                    let mut w = state_send.write().unwrap();
-                    w.connected = true;
-                }
-                thread::sleep(measurement_interval);
             }
         });
     }
 
     Ok(state)
 }
+
