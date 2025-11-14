@@ -545,6 +545,22 @@ fn parse_measurement_from_xml(xml: &str, r: u16, g: u16, b: u16) -> Result<Measu
         }
     }
     res.shapes = parsed_shapes;
+
+    // Debug output for received command: prefer the first parsed shape's color if available
+    let (bit_depth, r_val, g_val, b_val) = if let Some(shape) = res.shapes.get(0) {
+        match shape {
+            ShapeInstruction::Rectangle(rsh) => (
+                rsh.color.depth_bits,
+                rsh.color.red,
+                rsh.color.green,
+                rsh.color.blue,
+            ),
+        }
+    } else {
+        (8u8, res.red, res.green, res.blue)
+    };
+
+    println!("Bit depth = {} , R = {} , G = {} , B = {}", bit_depth, r_val, g_val, b_val);
     Ok(res)
 }
 
