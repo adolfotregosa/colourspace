@@ -204,6 +204,9 @@ fn rebuild_needed(
 pub struct HdrSupport {
     pub hdr10: bool,
     pub hlg: bool,
+    /// A 10-bit surface in the normal SDR (sRGB) colour space is offered: SDR patches can be
+    /// shown with their full 10-bit values instead of being rounded to 8 bits.
+    pub sdr10: bool,
     /// SDL video driver the check ran on ("wayland", "x11", ...).
     pub driver: String,
     /// Set when the check itself could not be completed (no Vulkan, no window, ...).
@@ -309,12 +312,16 @@ const HDR_FORMATS: [vk::Format; 2] = [
     vk::Format::A2R10G10B10_UNORM_PACK32,
 ];
 
-/// (HDR10 PQ offered, HLG offered) among a surface's formats.
-fn classify_formats(formats: &[vk::SurfaceFormatKHR]) -> (bool, bool) {
+/// (HDR10 PQ offered, HLG offered, 10-bit SDR offered) among a surface's formats.
+fn classify_formats(formats: &[vk::SurfaceFormatKHR]) -> (bool, bool, bool) {
     let offers = |space: vk::ColorSpaceKHR| {
         formats.iter().any(|f| HDR_FORMATS.contains(&f.format) && f.color_space == space)
     };
-    (offers(vk::ColorSpaceKHR::HDR10_ST2084_EXT), offers(vk::ColorSpaceKHR::HDR10_HLG_EXT))
+    (
+        offers(vk::ColorSpaceKHR::HDR10_ST2084_EXT),
+        offers(vk::ColorSpaceKHR::HDR10_HLG_EXT),
+        offers(vk::ColorSpaceKHR::SRGB_NONLINEAR),
+    )
 }
 
 /// HDR needs the native Wayland SDL driver (XWayland has no HDR). Ask for it unless the user
@@ -329,22 +336,33 @@ pub fn prefer_wayland_driver() {
 /// open a small hidden Vulkan window on the driver HDR would use and ask which surface
 /// formats it is offered. Uses (and fully releases) its own SDL context.
 pub fn probe() -> HdrSupport {
+    probe_with(true)
+}
+
+/// Same, but without asking the desktop whether HDR is switched on. Enough for deciding
+/// whether SDR patches can use the 10-bit path (`sdr10`), which is all a plain SDR run needs.
+pub fn probe_quick() -> HdrSupport {
+    probe_with(false)
+}
+
+fn probe_with(ask_desktop: bool) -> HdrSupport {
     prefer_wayland_driver();
     let mut support = match probe_inner() {
         Ok(support) => support,
         Err(problem) => HdrSupport { problem: Some(problem), ..Default::default() },
     };
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-    let kde_state = if support.hdr10 || support.hlg {
+    let kde_state = if ask_desktop && (support.hdr10 || support.hlg) {
         kde_hdr_state_with(&desktop, run_kscreen_doctor)
     } else {
         None
     };
     support.kde_hdr_off = kde_state == Some(false);
     eprintln!(
-        "HDR check: HDR10={} HLG={} (SDL driver: {}){}{}",
+        "HDR check: HDR10={} HLG={} SDR-10bit={} (SDL driver: {}){}{}",
         support.hdr10,
         support.hlg,
+        support.sdr10,
         if support.driver.is_empty() { "?" } else { &support.driver },
         match kde_state {
             Some(true) => ", KDE display HDR: on",
@@ -385,11 +403,13 @@ fn probe_inner() -> Result<HdrSupport, String> {
     let has_colourspace_ext = available.iter().any(|e| {
         e.extension_name_as_c_str().map(|n| n == ext::swapchain_colorspace::NAME).unwrap_or(false)
     });
-    if !has_colourspace_ext {
+    if has_colourspace_ext {
+        ext_names.push(ext::swapchain_colorspace::NAME.to_owned());
+    } else {
+        // HDR is impossible without it, but plain SDR surfaces (and their 10-bit variants) do
+        // not need it, so the rest of the check still runs.
         support.problem = Some("the Vulkan driver lacks VK_EXT_swapchain_colorspace".to_string());
-        return Ok(support);
     }
-    ext_names.push(ext::swapchain_colorspace::NAME.to_owned());
     let ext_ptrs: Vec<*const c_char> = ext_names.iter().map(|s| s.as_ptr()).collect();
 
     let app_info = vk::ApplicationInfo::default()
@@ -413,8 +433,8 @@ fn probe_inner() -> Result<HdrSupport, String> {
         }
     };
 
-    let queried = (|| -> Result<(bool, bool), String> {
-        let (mut hdr10, mut hlg) = (false, false);
+    let queried = (|| -> Result<(bool, bool, bool), String> {
+        let (mut hdr10, mut hlg, mut sdr10) = (false, false, false);
         for pd in unsafe { instance.enumerate_physical_devices() }.map_err(vk_err)? {
             let dev_exts = unsafe { instance.enumerate_device_extension_properties(pd) }.map_err(vk_err)?;
             let has_swapchain = dev_exts
@@ -434,11 +454,12 @@ fn probe_inner() -> Result<HdrSupport, String> {
             }
             let formats =
                 unsafe { surface_loader.get_physical_device_surface_formats(pd, surface) }.map_err(vk_err)?;
-            let (a, b) = classify_formats(&formats);
+            let (a, b, c) = classify_formats(&formats);
             hdr10 |= a;
             hlg |= b;
+            sdr10 |= c;
         }
-        Ok((hdr10, hlg))
+        Ok((hdr10, hlg, sdr10))
     })();
 
     // Release everything Vulkan before the window and SDL go away.
@@ -447,15 +468,75 @@ fn probe_inner() -> Result<HdrSupport, String> {
         instance.destroy_instance(None);
     }
 
-    let (hdr10, hlg) = queried?;
-    support.hdr10 = hdr10;
-    support.hlg = hlg;
+    let (hdr10, hlg, sdr10) = queried?;
+    support.hdr10 = hdr10 && has_colourspace_ext;
+    support.hlg = hlg && has_colourspace_ext;
+    support.sdr10 = sdr10;
     Ok(support)
 }
 
 // -------------------------------------------------------------------------------------
 // Vulkan presenter
 // -------------------------------------------------------------------------------------
+
+/// Releases the Vulkan objects created so far when `HdrPresenter::new` gives up half-way, so a
+/// failed attempt (for example the automatic 10-bit SDR one) leaves nothing behind before the
+/// program falls back to the SDL renderer.
+struct EarlyCleanup {
+    instance: ash::Instance,
+    surface_loader: khr::surface::Instance,
+    surface: vk::SurfaceKHR,
+    device: Option<ash::Device>,
+    render_pass: vk::RenderPass,
+    command_pool: vk::CommandPool,
+    image_available: vk::Semaphore,
+    in_flight: vk::Fence,
+    armed: bool,
+}
+
+impl EarlyCleanup {
+    fn new(instance: &ash::Instance, surface_loader: &khr::surface::Instance, surface: vk::SurfaceKHR) -> Self {
+        Self {
+            instance: instance.clone(),
+            surface_loader: surface_loader.clone(),
+            surface,
+            device: None,
+            render_pass: vk::RenderPass::null(),
+            command_pool: vk::CommandPool::null(),
+            image_available: vk::Semaphore::null(),
+            in_flight: vk::Fence::null(),
+            armed: true,
+        }
+    }
+}
+
+impl Drop for EarlyCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        unsafe {
+            if let Some(device) = &self.device {
+                let _ = device.device_wait_idle();
+                if self.in_flight != vk::Fence::null() {
+                    device.destroy_fence(self.in_flight, None);
+                }
+                if self.image_available != vk::Semaphore::null() {
+                    device.destroy_semaphore(self.image_available, None);
+                }
+                if self.command_pool != vk::CommandPool::null() {
+                    device.destroy_command_pool(self.command_pool, None);
+                }
+                if self.render_pass != vk::RenderPass::null() {
+                    device.destroy_render_pass(self.render_pass, None);
+                }
+                device.destroy_device(None);
+            }
+            self.surface_loader.destroy_surface(self.surface, None);
+            self.instance.destroy_instance(None);
+        }
+    }
+}
 
 pub struct HdrPresenter {
     // NOTE: `window` must outlive every Vulkan object created from it; `Drop` below
@@ -497,7 +578,9 @@ impl HdrPresenter {
         let colour_space = match mode {
             HdrMode::Hdr10 => vk::ColorSpaceKHR::HDR10_ST2084_EXT,
             HdrMode::Hlg => vk::ColorSpaceKHR::HDR10_HLG_EXT,
-            HdrMode::Sdr => return other("HdrPresenter cannot be used for SDR output"),
+            // Plain SDR: the ordinary sRGB colour space, but with a 10-bit surface so ColourSpace's
+            // 10-bit codes are shown as they are instead of being rounded to 8 bits.
+            HdrMode::Sdr => vk::ColorSpaceKHR::SRGB_NONLINEAR,
         };
 
         // Use SDL's vkGetInstanceProcAddr so ash and SDL share the same Vulkan loader.
@@ -523,13 +606,15 @@ impl HdrPresenter {
                 .iter()
                 .any(|e| e.extension_name_as_c_str().map(|n| n == name).unwrap_or(false))
         };
-        if !has_instance_ext(ext::swapchain_colorspace::NAME) {
-            return other(
-                "The Vulkan driver does not expose VK_EXT_swapchain_colorspace, \
-                 so HDR swapchains are not available.",
-            );
+        if mode != HdrMode::Sdr {
+            if !has_instance_ext(ext::swapchain_colorspace::NAME) {
+                return other(
+                    "The Vulkan driver does not expose VK_EXT_swapchain_colorspace, \
+                     so HDR swapchains are not available.",
+                );
+            }
+            ext_names.push(ext::swapchain_colorspace::NAME.to_owned());
         }
-        ext_names.push(ext::swapchain_colorspace::NAME.to_owned());
         let ext_ptrs: Vec<*const c_char> = ext_names.iter().map(|s| s.as_ptr()).collect();
 
         let app_info = vk::ApplicationInfo::default()
@@ -545,11 +630,17 @@ impl HdrPresenter {
         };
 
         // ---- surface ------------------------------------------------------------------
-        let raw_surface = window
-            .vulkan_create_surface(instance.handle().as_raw() as usize)
-            .map_err(|e| HdrError::Other(format!("SDL could not create a Vulkan surface: {e}")))?;
+        let raw_surface = match window.vulkan_create_surface(instance.handle().as_raw() as usize) {
+            Ok(raw) => raw,
+            Err(e) => {
+                unsafe { instance.destroy_instance(None) };
+                return other(format!("SDL could not create a Vulkan surface: {e}"));
+            }
+        };
         let surface = vk::SurfaceKHR::from_raw(raw_surface);
         let surface_loader = khr::surface::Instance::new(&entry, &instance);
+        // From here on, any early return releases what has been created so far.
+        let mut cleanup = EarlyCleanup::new(&instance, &surface_loader, surface);
 
         // ---- physical device / queue family / HDR format ------------------------------
         let wanted_formats = [
@@ -608,37 +699,43 @@ impl HdrPresenter {
 
         let Some((physical_device, queue_family, surface_format, device_name, has_hdr_md)) = chosen
         else {
-            let mut msg = format!(
-                "No GPU offers a 10-bit {} surface for this window.\n\n\
-                 HDR needs: a compositor with HDR enabled (e.g. KDE Plasma 6 or another \
-                 colour-management-v1 compositor), Mesa 25.1+ or a recent NVIDIA driver, and \
-                 the SDL Wayland video driver (SDL_VIDEODRIVER=wayland). It does not work \
-                 through XWayland.",
-                match mode {
-                    HdrMode::Hlg => "HDR10 HLG",
-                    _ => "HDR10 PQ",
-                }
-            );
+            let mut msg = if mode == HdrMode::Sdr {
+                String::from("No GPU offers a 10-bit SDR surface for this window.")
+            } else {
+                format!(
+                    "No GPU offers a 10-bit {} surface for this window.\n\n\
+                     HDR needs: a compositor with HDR enabled (e.g. KDE Plasma 6 or another \
+                     colour-management-v1 compositor), Mesa 25.1+ or a recent NVIDIA driver, and \
+                     the SDL Wayland video driver (SDL_VIDEODRIVER=wayland). It does not work \
+                     through XWayland.",
+                    if mode == HdrMode::Hlg { "HDR10 HLG" } else { "HDR10 PQ" }
+                )
+            };
             if !seen.is_empty() {
                 msg.push_str("\n\nSurface formats offered:\n");
                 msg.push_str(&seen.join("\n"));
             }
-            unsafe {
-                surface_loader.destroy_surface(surface, None);
-                instance.destroy_instance(None);
-            }
-            return other(msg);
+            return other(msg); // `cleanup` releases the instance and surface
         };
-        eprintln!(
-            "HDR: {} on \"{}\" using {:?} / {:?} (VK_EXT_hdr_metadata: {})",
-            mode.label(),
-            device_name,
-            surface_format.format,
-            surface_format.color_space,
-            if has_hdr_md { "yes" } else { "no" }
-        );
-        if !has_hdr_md {
-            eprintln!("HDR: warning, VK_EXT_hdr_metadata missing; the display may not receive static metadata");
+        // Static HDR metadata only makes sense for HDR signals.
+        let has_hdr_md = has_hdr_md && mode != HdrMode::Sdr;
+        if mode == HdrMode::Sdr {
+            eprintln!(
+                "SDR: 10-bit output on \"{}\" using {:?} / {:?}",
+                device_name, surface_format.format, surface_format.color_space
+            );
+        } else {
+            eprintln!(
+                "HDR: {} on \"{}\" using {:?} / {:?} (VK_EXT_hdr_metadata: {})",
+                mode.label(),
+                device_name,
+                surface_format.format,
+                surface_format.color_space,
+                if has_hdr_md { "yes" } else { "no" }
+            );
+            if !has_hdr_md {
+                eprintln!("HDR: warning, VK_EXT_hdr_metadata missing; the display may not receive static metadata");
+            }
         }
 
         // ---- logical device -----------------------------------------------------------
@@ -659,6 +756,7 @@ impl HdrPresenter {
                 None,
             )?
         };
+        cleanup.device = Some(device.clone());
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let swapchain_loader = khr::swapchain::Device::new(&instance, &device);
         let hdr_loader = has_hdr_md.then(|| ext::hdr_metadata::Device::new(&instance, &device));
@@ -695,6 +793,8 @@ impl HdrPresenter {
             )?
         };
 
+        cleanup.render_pass = render_pass;
+
         // ---- commands and sync --------------------------------------------------------
         let command_pool = unsafe {
             device.create_command_pool(
@@ -704,6 +804,7 @@ impl HdrPresenter {
                 None,
             )?
         };
+        cleanup.command_pool = command_pool;
         let command_buffer = unsafe {
             device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -714,12 +815,15 @@ impl HdrPresenter {
         };
         let image_available =
             unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)? };
+        cleanup.image_available = image_available;
         let in_flight = unsafe {
             device.create_fence(
                 &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
                 None,
             )?
         };
+
+        cleanup.in_flight = in_flight;
 
         let mut presenter = Self {
             window,
@@ -747,7 +851,8 @@ impl HdrPresenter {
             framebuffers: Vec::new(),
             render_finished: Vec::new(),
         };
-        // If this fails, `presenter` is dropped and `Drop` cleans everything up.
+        // From here on `presenter` owns everything: if the next step fails, its `Drop` cleans up.
+        cleanup.armed = false;
         presenter.recreate_swapchain()?;
         Ok(presenter)
     }
@@ -1135,11 +1240,17 @@ mod tests {
         let hlg = f(vk::Format::A2R10G10B10_UNORM_PACK32, vk::ColorSpaceKHR::HDR10_HLG_EXT);
         let wrong_depth = f(vk::Format::B8G8R8A8_UNORM, vk::ColorSpaceKHR::HDR10_ST2084_EXT);
 
-        assert_eq!(classify_formats(&[]), (false, false));
-        assert_eq!(classify_formats(&[sdr, wrong_depth]), (false, false));
-        assert_eq!(classify_formats(&[sdr, pq]), (true, false));
-        assert_eq!(classify_formats(&[hlg]), (false, true));
-        assert_eq!(classify_formats(&[pq, hlg]), (true, true));
+        let sdr_10bit = f(vk::Format::A2R10G10B10_UNORM_PACK32, vk::ColorSpaceKHR::SRGB_NONLINEAR);
+        let sdr_10bit_abgr = f(vk::Format::A2B10G10R10_UNORM_PACK32, vk::ColorSpaceKHR::SRGB_NONLINEAR);
+
+        assert_eq!(classify_formats(&[]), (false, false, false));
+        assert_eq!(classify_formats(&[sdr, wrong_depth]), (false, false, false), "8-bit SDR is not 10-bit SDR");
+        assert_eq!(classify_formats(&[sdr, pq]), (true, false, false));
+        assert_eq!(classify_formats(&[hlg]), (false, true, false));
+        assert_eq!(classify_formats(&[pq, hlg]), (true, true, false));
+        assert_eq!(classify_formats(&[sdr, sdr_10bit]), (false, false, true));
+        assert_eq!(classify_formats(&[sdr_10bit_abgr]), (false, false, true));
+        assert_eq!(classify_formats(&[pq, sdr_10bit]), (true, false, true));
         assert!(HdrSupport { hlg: true, ..Default::default() }.any());
         assert!(!HdrSupport::default().any());
     }

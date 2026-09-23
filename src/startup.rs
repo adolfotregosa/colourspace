@@ -1072,11 +1072,11 @@ mod tests {
     }
 
     fn full() -> HdrSupport {
-        HdrSupport { hdr10: true, hlg: true, driver: "wayland".into(), problem: None, kde_hdr_off: false }
+        HdrSupport { hdr10: true, hlg: true, sdr10: true, driver: "wayland".into(), problem: None, kde_hdr_off: false }
     }
 
     fn none() -> HdrSupport {
-        HdrSupport { hdr10: false, hlg: false, driver: "wayland".into(), problem: None, kde_hdr_off: false }
+        HdrSupport { hdr10: false, hlg: false, sdr10: false, driver: "wayland".into(), problem: None, kde_hdr_off: false }
     }
 
     fn click(form: &mut Form, r: Rect) -> Action {

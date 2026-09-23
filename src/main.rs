@@ -90,17 +90,18 @@ fn initial_settings(args: &Args, saved: &config::Saved) -> startup::Settings {
     settings
 }
 
-/// Where patches end up: the original 8-bit SDL renderer, or the Vulkan HDR presenter.
+/// Where patches end up: the original 8-bit SDL renderer, or the Vulkan presenter with a 10-bit
+/// surface (used for HDR, and for SDR whenever the system offers a 10-bit SDR surface).
 enum Output {
     Sdr(Canvas<Window>),
-    Hdr(HdrPresenter),
+    Vulkan(HdrPresenter),
 }
 
 impl Output {
     fn window_mut(&mut self) -> &mut Window {
         match self {
             Output::Sdr(canvas) => canvas.window_mut(),
-            Output::Hdr(hdr) => hdr.window_mut(),
+            Output::Vulkan(hdr) => hdr.window_mut(),
         }
     }
 
@@ -109,7 +110,7 @@ impl Output {
     fn size(&mut self) -> Result<(u32, u32), Box<dyn Error>> {
         match self {
             Output::Sdr(canvas) => Ok(canvas.output_size()?),
-            Output::Hdr(hdr) => Ok(hdr.sync_size()?),
+            Output::Vulkan(hdr) => Ok(hdr.sync_size()?),
         }
     }
 }
@@ -144,11 +145,12 @@ fn add_default_port(s: &str) -> String {
     }
 }
 
-/// Window title: shows the HDR mode and whether the link to ColourSpace is up.
-fn window_title(mode: HdrMode, disconnected: bool) -> String {
+/// Window title: shows the output in use (`tag`: "HDR10", "HLG", "SDR 10-bit"; none for the
+/// plain SDL renderer) and whether the link to ColourSpace is up.
+fn window_title(tag: Option<&str>, disconnected: bool) -> String {
     let mut title = String::from("Calibration Client Linux");
-    if mode != HdrMode::Sdr {
-        title.push_str(&format!(" [{}]", mode.label()));
+    if let Some(tag) = tag {
+        title.push_str(&format!(" [{tag}]"));
     }
     if disconnected {
         title.push_str(" - connection lost, reconnecting...");
@@ -204,8 +206,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let hdr_mode = settings.hdr;
 
-    // HDR only works through the native Wayland driver (XWayland has no HDR).
-    if hdr_mode != HdrMode::Sdr {
+    // SDR is normally drawn by SDL's 8-bit renderer, which rounds ColourSpace's 10-bit codes to
+    // 8 bits. When the system offers a 10-bit SDR surface, the Vulkan path is used instead so the
+    // codes reach the compositor as they are. Automatic: if it is not offered (or Vulkan is not
+    // available at all) nothing changes and the SDL renderer is used exactly as before.
+    // (The startup window already checked this if it was shown.)
+    let use_sdr10 = hdr_mode == HdrMode::Sdr
+        && hdr_support.as_ref().map(|s| s.sdr10).unwrap_or_else(|| hdr::probe_quick().sdr10);
+
+    // HDR, and 10-bit SDR, work through the native Wayland driver (XWayland offers neither).
+    if hdr_mode != HdrMode::Sdr || use_sdr10 {
         hdr::prefer_wayland_driver();
     }
 
@@ -215,15 +225,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     const DEFAULT_W: u32 = 1280;
     const DEFAULT_H: u32 = 720;
 
+    // What the title bar says about the output ("HDR10", "HLG", "SDR 10-bit"); none for plain SDL.
+    let mut title_tag: Option<&'static str> = match hdr_mode {
+        HdrMode::Hdr10 => Some("HDR10"),
+        HdrMode::Hlg => Some("HLG"),
+        HdrMode::Sdr if use_sdr10 => Some("SDR 10-bit"),
+        HdrMode::Sdr => None,
+    };
+
     // Always start windowed; fullscreen only via double-click
-    let initial_title = window_title(hdr_mode, false);
-    let window = video
-    .window(&initial_title, DEFAULT_W, DEFAULT_H)
-    .position_centered()
-    .vulkan()
-    .resizable()
-    .allow_highdpi()
-    .build()?;
+    let make_window = |tag: Option<&str>| {
+        video
+            .window(&window_title(tag, false), DEFAULT_W, DEFAULT_H)
+            .position_centered()
+            .vulkan()
+            .resizable()
+            .allow_highdpi()
+            .build()
+    };
 
     fn select_measure_colour(shapes: &[ShapeInstruction]) -> Option<ColorRGB> {
         shapes
@@ -240,9 +259,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     /// Helper: convert a `ColorRGB` (u16 + depth_bits) into an 8-bit RGB tuple.
     ///
-    /// Note: this is intentionally local to `main.rs` so the `lan` module stays
-    /// depth-agnostic. When you add a Vulkan 10-bit pipeline, replace or extend
-    /// this helper to return higher-bit buffers or skip the conversion entirely.
+    /// Only used by the SDL renderer, which is 8-bit. When the system offers a 10-bit surface
+    /// (HDR always, SDR automatically) the Vulkan path is used instead and the codes are never
+    /// rounded to 8 bits. This helper is intentionally local to `main.rs` so the `lan` module
+    /// stays depth-agnostic.
     fn color_to_u8_tuple(color: ColorRGB) -> (u8, u8, u8) {
         let bits = if color.depth_bits == 0 { 8 } else { color.depth_bits };
         let max_in: u32 = if bits >= 16 {
@@ -311,27 +331,42 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut current_measure_colour = ColorRGB::default();
 
     // Build the output once we have a worker (or the user cancelled earlier).
+    let metadata = HdrMetadata {
+        primaries: settings.primaries,
+        max_luminance: settings.max_luminance,
+        min_luminance: settings.min_luminance,
+        max_cll: settings.max_cll,
+        max_fall: settings.max_fall,
+    };
     let mut output = match hdr_mode {
-        HdrMode::Sdr => Output::Sdr(window.into_canvas().build()?),
-        mode => {
-            let metadata = HdrMetadata {
-                primaries: settings.primaries,
-                max_luminance: settings.max_luminance,
-                min_luminance: settings.min_luminance,
-                max_cll: settings.max_cll,
-                max_fall: settings.max_fall,
-            };
-            match HdrPresenter::new(window, mode, metadata) {
-                Ok(presenter) => Output::Hdr(presenter),
-                Err(err) => {
-                    // Never fall back to SDR silently: measuring the wrong signal is worse than failing.
-                    eprintln!("{} output unavailable: {}", mode.label(), err);
-                    let text = format!("{} output is not available\n\n{}", mode.label(), err);
-                    let _ = tfd::message_box_ok("Calibration Client Linux", &text, tfd::MessageBoxIcon::Error);
-                    return Err(err.into());
+        HdrMode::Sdr => {
+            let mut presenter = None;
+            if use_sdr10 {
+                match HdrPresenter::new(make_window(title_tag)?, HdrMode::Sdr, metadata) {
+                    Ok(p) => presenter = Some(p),
+                    Err(err) => {
+                        // Unlike HDR, falling back is exactly right here: the SDL renderer is the
+                        // proven path, and SDR is what was asked for either way.
+                        eprintln!("10-bit SDR output could not be started ({err}); using the standard 8-bit renderer");
+                        title_tag = None;
+                    }
                 }
             }
+            match presenter {
+                Some(p) => Output::Vulkan(p),
+                None => Output::Sdr(make_window(title_tag)?.into_canvas().build()?),
+            }
         }
+        mode => match HdrPresenter::new(make_window(title_tag)?, mode, metadata) {
+            Ok(presenter) => Output::Vulkan(presenter),
+            Err(err) => {
+                // Never fall back to SDR silently: measuring the wrong signal is worse than failing.
+                eprintln!("{} output unavailable: {}", mode.label(), err);
+                let text = format!("{} output is not available\n\n{}", mode.label(), err);
+                let _ = tfd::message_box_ok("Calibration Client Linux", &text, tfd::MessageBoxIcon::Error);
+                return Err(err.into());
+            }
+        },
     };
     let mut title_shows_disconnected = false;
 
@@ -457,7 +492,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Show in the title bar when the link to ColourSpace drops (the worker reconnects itself)
         if disconnected != title_shows_disconnected {
             title_shows_disconnected = disconnected;
-            output.window_mut().set_title(&window_title(hdr_mode, disconnected)).ok();
+            output.window_mut().set_title(&window_title(title_tag, disconnected)).ok();
         }
 
         // Update current measure colour depending on worker state and shapes
@@ -485,7 +520,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // Present once per frame (consistent timing fixes the double-click quirk)
                 canvas.present();
             }
-            Output::Hdr(hdr) => {
+            Output::Vulkan(hdr) => {
                 // Code values go to the 10-bit HDR swapchain untouched (no 8-bit downscale).
                 if show_shapes {
                     let rects = shapes_to_fill_rects(&shapes, cw, ch);
@@ -590,8 +625,9 @@ mod tests {
 
     #[test]
     fn title_reflects_mode_and_connection() {
-        assert_eq!(window_title(HdrMode::Sdr, false), "Calibration Client Linux");
-        assert_eq!(window_title(HdrMode::Hdr10, false), "Calibration Client Linux [HDR10]");
-        assert!(window_title(HdrMode::Hlg, true).contains("reconnecting"));
+        assert_eq!(window_title(None, false), "Calibration Client Linux");
+        assert_eq!(window_title(Some("HDR10"), false), "Calibration Client Linux [HDR10]");
+        assert_eq!(window_title(Some("SDR 10-bit"), false), "Calibration Client Linux [SDR 10-bit]");
+        assert!(window_title(Some("HLG"), true).contains("reconnecting"));
     }
 }
