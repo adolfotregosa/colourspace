@@ -104,12 +104,14 @@ impl Settings {
 // Layout
 // -------------------------------------------------------------------------------------
 
-const W: i32 = 580;
+/// Wide enough for the whole window title: KDE centres the title between its left and right
+/// button groups, so a narrow window elides it ("Calibratio...ient Linux").
+const W: i32 = 680;
 const SCALE: i32 = 2; // 8x8 glyphs drawn at 16x16
 const GLYPH: i32 = 8 * SCALE;
 const LABEL_X: i32 = 24;
 const CTRL_X: i32 = 270;
-const CTRL_W: i32 = 286;
+const CTRL_W: i32 = W - CTRL_X - 24; // the controls stretch to a 24px right margin
 const ROW_H: i32 = 32;
 
 const IP_Y: i32 = 64;
@@ -205,11 +207,12 @@ fn buttons_y(advanced_open: bool) -> i32 {
 fn window_height(advanced_open: bool) -> i32 {
     buttons_y(advanced_open) + BTN_H + 32
 }
+/// Cancel and Connect are right-aligned with the controls above them.
 fn connect_rect(advanced_open: bool) -> Rect {
-    Rect::new(CTRL_X + BTN_W + 14, buttons_y(advanced_open), BTN_W as u32, BTN_H as u32)
+    Rect::new(CTRL_X + CTRL_W - BTN_W, buttons_y(advanced_open), BTN_W as u32, BTN_H as u32)
 }
 fn cancel_rect(advanced_open: bool) -> Rect {
-    Rect::new(CTRL_X, buttons_y(advanced_open), BTN_W as u32, BTN_H as u32)
+    Rect::new(CTRL_X + CTRL_W - 2 * BTN_W - 14, buttons_y(advanced_open), BTN_W as u32, BTN_H as u32)
 }
 
 // -------------------------------------------------------------------------------------
@@ -1694,6 +1697,19 @@ mod tests {
             assert!(!form.advanced_open);
             assert!(!form.focusable(F_ADV));
         }
+    }
+
+    #[test]
+    fn the_window_is_wide_enough_for_a_full_title_bar() {
+        // a 24-character title at a typical 8-9px per character, centred between two button
+        // groups of up to ~180px each (KDE with a few extra buttons); a 614px window was seen to
+        // show it whole and a 582px one to elide it
+        assert!(W >= 660, "window is {W}px wide");
+        // the controls use the width, keeping the same right margin
+        assert_eq!(CTRL_X + CTRL_W, W - 24);
+        assert_eq!(connect_rect(false).right(), CTRL_X + CTRL_W);
+        assert!(cancel_rect(false).right() < connect_rect(false).x());
+        assert!(cancel_rect(false).x() >= CTRL_X);
     }
 
     #[test]
