@@ -8,12 +8,109 @@ use std::time::{Duration, Instant};
 use std::thread::{sleep, spawn};
 use std::error::Error;
 
+mod hdr;
 mod lan;
+mod startup;
+use hdr::{color_to_unit_rgb, FillRect, HdrMetadata, HdrMode, HdrPresenter, Primaries};
 use lan::{ColorRGB, ShapeInstruction, spawn_worker};
+use sdl2::render::Canvas;
+use sdl2::video::Window;
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 
+#[derive(FromArgs)]
+/// Colourspace viewer
+struct Args {
+    /// remote server host[:port] (positional). Optional.
+    #[argh(positional)]
+    remote: Option<String>,
+
+    /// output signal: sdr (default), hdr10 (BT.2020 PQ) or hlg
+    #[argh(option, default = "HdrMode::Sdr")]
+    hdr: HdrMode,
+
+    /// mastering display primaries in the HDR metadata: bt2020 (default) or p3d65
+    #[argh(option, default = "Primaries::Bt2020")]
+    primaries: Primaries,
+
+    /// mastering display peak luminance in cd/m2 for the HDR metadata (default 1000)
+    #[argh(option, default = "1000.0")]
+    max_luminance: f32,
+
+    /// mastering display black level in cd/m2 for the HDR metadata (default 0.0001)
+    #[argh(option, default = "0.0001")]
+    min_luminance: f32,
+
+    /// maximum content light level (MaxCLL) in cd/m2 for the HDR metadata (default 0 = unspecified)
+    #[argh(option, default = "0.0")]
+    max_cll: f32,
+
+    /// maximum frame average light level (MaxFALL) in cd/m2 for the HDR metadata (default 0 = unspecified)
+    #[argh(option, default = "0.0")]
+    max_fall: f32,
+}
+
+/// Where patches end up: the original 8-bit SDL renderer, or the Vulkan HDR presenter.
+enum Output {
+    Sdr(Canvas<Window>),
+    Hdr(HdrPresenter),
+}
+
+impl Output {
+    fn window_mut(&mut self) -> &mut Window {
+        match self {
+            Output::Sdr(canvas) => canvas.window_mut(),
+            Output::Hdr(hdr) => hdr.window_mut(),
+        }
+    }
+
+    fn size(&self) -> Result<(u32, u32), String> {
+        match self {
+            Output::Sdr(canvas) => canvas.output_size(),
+            Output::Hdr(hdr) => Ok(hdr.output_size()),
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    // Parse arguments first: HDR needs to pick the SDL video driver before SDL starts.
+    let mut args: Args = argh::from_env();
+
+    // No IP on the command line: show the startup window (IP + HDR checkbox and menus),
+    // pre-filled from any options that were given. This runs before SDL is started for
+    // the main window because the HDR choice decides which video driver SDL must use.
+    if args.remote.is_none() {
+        let defaults = startup::Settings {
+            remote: String::new(),
+            hdr: args.hdr,
+            primaries: args.primaries,
+            max_luminance: args.max_luminance,
+            min_luminance: args.min_luminance,
+            max_cll: args.max_cll,
+            max_fall: args.max_fall,
+        };
+        match startup::show(defaults)? {
+            Some(chosen) => {
+                args.remote = Some(chosen.remote);
+                args.hdr = chosen.hdr;
+                args.primaries = chosen.primaries;
+                args.max_luminance = chosen.max_luminance;
+                args.min_luminance = chosen.min_luminance;
+                args.max_cll = chosen.max_cll;
+                args.max_fall = chosen.max_fall;
+            }
+            None => return Ok(()),
+        }
+    }
+
+    // HDR only works through the native Wayland driver (XWayland has no HDR).
+    if args.hdr != HdrMode::Sdr
+        && std::env::var_os("SDL_VIDEODRIVER").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_some()
+    {
+        sdl2::hint::set("SDL_VIDEODRIVER", "wayland");
+    }
+
     let sdl_context = sdl2::init()?;
     let video = sdl_context.video()?;
 
@@ -21,21 +118,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     const DEFAULT_H: u32 = 720;
 
     // Always start windowed; fullscreen only via double-click
+    let window_title = match args.hdr {
+        HdrMode::Sdr => "Calibration Client Linux".to_string(),
+        mode => format!("Calibration Client Linux [{}]", mode.label()),
+    };
     let window = video
-    .window("Calibration Client Linux", DEFAULT_W, DEFAULT_H)
+    .window(&window_title, DEFAULT_W, DEFAULT_H)
     .position_centered()
     .vulkan()
     .resizable()
     .allow_highdpi()
     .build()?;
-
-    #[derive(FromArgs)]
-    /// Colourspace viewer
-    struct Args {
-        /// remote server host[:port] (positional). Optional.
-        #[argh(positional)]
-        remote: Option<String>,
-    }
 
     fn pad(msg: &str, width: usize) -> String {
         let mut s = msg.to_string();
@@ -107,6 +200,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         (r, g, b)
     }
 
+    /// Centre a rectangle (width/height as 0..1 fractions of the output) on the output.
+    /// Returns (left, top, width, height) in pixels; always at least 1x1.
+    fn centered_rect(geom: lan::RectangleGeometry, w: u32, h: u32) -> (i32, i32, u32, u32) {
+        let rw = (geom.width.clamp(0.0, 1.0) * w as f32).round().max(1.0) as u32;
+        let rh = (geom.height.clamp(0.0, 1.0) * h as f32).round().max(1.0) as u32;
+        let left = ((w as f32 - rw as f32) / 2.0).round() as i32;
+        let top = ((h as f32 - rh as f32) / 2.0).round() as i32;
+        (left, top, rw, rh)
+    }
+
+    /// HDR path: turn shape instructions into flat rectangles with unmodified signal levels.
+    fn shapes_to_fill_rects(shapes: &[ShapeInstruction], w: u32, h: u32) -> Vec<FillRect> {
+        shapes
+            .iter()
+            .map(|shape| match shape {
+                ShapeInstruction::Rectangle(rect) => {
+                    let (x, y, rw, rh) = centered_rect(rect.geometry, w, h);
+                    FillRect { x, y, w: rw, h: rh, rgb: color_to_unit_rgb(rect.color) }
+                }
+            })
+            .collect()
+    }
+
     fn draw_shapes(
         canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
         shapes: &[ShapeInstruction],
@@ -119,13 +235,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         for shape in shapes {
             match shape {
                 ShapeInstruction::Rectangle(rect) => {
-                    let geom = rect.geometry;
-                    // clamp widths/heights and ensure at least 1 pixel
-                    let rw = (geom.width.clamp(0.0, 1.0) * w as f32).round().max(1.0) as u32;
-                    let rh = (geom.height.clamp(0.0, 1.0) * h as f32).round().max(1.0) as u32;
-
-                    let left = ((w as f32 - rw as f32) / 2.0).round() as i32;
-                    let top = ((h as f32 - rh as f32) / 2.0).round() as i32;
+                    let (left, top, rw, rh) = centered_rect(rect.geometry, w, h);
 
                     let color = rect.color;
                     // downscale from u16/depth to u8 here using local helper
@@ -136,11 +246,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
-
-    // ---------------------------------------------------------------------
-    // ARG PARSING (ONLY POSITIONAL IP)
-    // ---------------------------------------------------------------------
-    let args: Args = argh::from_env();
 
     // ---------------------------------------------------------------------
     // Create event pump early so we can keep the window responsive during waits
@@ -279,8 +384,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    // Build the canvas once we have a worker (or the user cancelled earlier).
-    let mut canvas = window.into_canvas().build()?;
+    // Build the output once we have a worker (or the user cancelled earlier).
+    let mut output = match args.hdr {
+        HdrMode::Sdr => Output::Sdr(window.into_canvas().build()?),
+        mode => {
+            let metadata = HdrMetadata {
+                primaries: args.primaries,
+                max_luminance: args.max_luminance,
+                min_luminance: args.min_luminance,
+                max_cll: args.max_cll,
+                max_fall: args.max_fall,
+            };
+            match HdrPresenter::new(window, mode, metadata) {
+                Ok(presenter) => Output::Hdr(presenter),
+                Err(err) => {
+                    // Never fall back to SDR silently: measuring the wrong signal is worse than failing.
+                    eprintln!("{} output unavailable: {}", mode.label(), err);
+                    let text = format!("{} output is not available\n\n{}", mode.label(), err);
+                    let _ = tfd::message_box_ok("Calibration Client Linux", &text, tfd::MessageBoxIcon::Error);
+                    return Err(err.into());
+                }
+            }
+        }
+    };
     // Note: we already created event_pump earlier; reuse it.
 
     // double-click detection
@@ -315,14 +441,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                         if now.duration_since(prev) <= dc_threshold {
                             // Toggle fullscreen
                             if is_fullscreen {
-                                canvas
-                                .window_mut()
+                                output.window_mut()
                                 .set_fullscreen(sdl2::video::FullscreenType::Off)
                                 .ok();
                                 is_fullscreen = false;
                             } else {
-                                canvas
-                                .window_mut()
+                                output.window_mut()
                                 .set_fullscreen(sdl2::video::FullscreenType::Desktop)
                                 .ok();
                                 is_fullscreen = true;
@@ -356,14 +480,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                         if let Some(prev) = last_click_time {
                             if now.duration_since(prev) <= dc_threshold {
                                 if is_fullscreen {
-                                    canvas
-                                    .window_mut()
+                                    output.window_mut()
                                     .set_fullscreen(sdl2::video::FullscreenType::Off)
                                     .ok();
                                     is_fullscreen = false;
                                 } else {
-                                    canvas
-                                    .window_mut()
+                                    output.window_mut()
                                     .set_fullscreen(sdl2::video::FullscreenType::Desktop)
                                     .ok();
                                     is_fullscreen = true;
@@ -406,19 +528,33 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // Draw
-        let (cw, ch) = canvas.output_size()?;
-        if !disconnected && !shapes.is_empty() {
-            draw_shapes(&mut canvas, &shapes, cw, ch);
-        } else {
-            let c = current_measure_colour;
-            // downscale before giving to SDL using the helper
-            let (r8, g8, b8) = color_to_u8_tuple(c);
-            canvas.set_draw_color(Color::RGB(r8, g8, b8));
-            canvas.clear();
-        }
+        let (cw, ch) = output.size()?;
+        let show_shapes = !disconnected && !shapes.is_empty();
+        match &mut output {
+            Output::Sdr(canvas) => {
+                if show_shapes {
+                    draw_shapes(canvas, &shapes, cw, ch);
+                } else {
+                    let c = current_measure_colour;
+                    // downscale before giving to SDL using the helper
+                    let (r8, g8, b8) = color_to_u8_tuple(c);
+                    canvas.set_draw_color(Color::RGB(r8, g8, b8));
+                    canvas.clear();
+                }
 
-        // Present once per frame (consistent timing fixes the double-click quirk)
-        canvas.present();
+                // Present once per frame (consistent timing fixes the double-click quirk)
+                canvas.present();
+            }
+            Output::Hdr(hdr) => {
+                // Code values go to the 10-bit HDR swapchain untouched (no 8-bit downscale).
+                if show_shapes {
+                    let rects = shapes_to_fill_rects(&shapes, cw, ch);
+                    hdr.draw([0.0, 0.0, 0.0], &rects)?;
+                } else {
+                    hdr.draw(color_to_unit_rgb(current_measure_colour), &[])?;
+                }
+            }
+        }
 
         // small sleep to avoid burning CPU in pathological cases
         sleep(Duration::from_millis(1));
