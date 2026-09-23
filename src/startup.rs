@@ -105,7 +105,6 @@ impl Settings {
 // -------------------------------------------------------------------------------------
 
 const W: i32 = 580;
-const H: i32 = 540;
 const SCALE: i32 = 2; // 8x8 glyphs drawn at 16x16
 const GLYPH: i32 = 8 * SCALE;
 const LABEL_X: i32 = 24;
@@ -116,28 +115,52 @@ const ROW_H: i32 = 32;
 const IP_Y: i32 = 64;
 const CHECK_Y: i32 = 118;
 const NOTE_Y: i32 = 154; // status line(s) under the HDR checkbox, drawn at 8px
-const DD_Y0: i32 = 186;
+const DD_Y0: i32 = 186; // the Signal menu
 const DD_STEP: i32 = 44;
-const BTN_Y: i32 = 466;
+const ADV_Y: i32 = DD_Y0 + DD_STEP; // the "Advanced" row: a disclosure, and the Defaults button when open
+const ADV_ROWS_Y0: i32 = ADV_Y + DD_STEP; // first menu inside "Advanced"
 const BTN_W: i32 = 136;
 const BTN_H: i32 = 38;
 
-// Focus order (Tab cycles through these).
-const F_IP: usize = 0;
-const F_CHECK: usize = 1;
-const F_DD0: usize = 2; // dropdowns are F_DD0 + 0..6
+// Dropdown indices. Signal is always visible; the rest live inside "Advanced".
 const DD_COUNT: usize = 6;
-const F_CONNECT: usize = F_DD0 + DD_COUNT;
-const F_CANCEL: usize = F_CONNECT + 1;
-const F_COUNT: usize = F_CANCEL + 1;
-
-// Dropdown indices
 const DD_SIGNAL: usize = 0;
 const DD_PRIMARIES: usize = 1;
 const DD_MAX_LUM: usize = 2;
 const DD_MIN_LUM: usize = 3;
 const DD_MAX_CLL: usize = 4;
 const DD_MAX_FALL: usize = 5;
+
+// Focus order (Tab cycles through these, top to bottom as they appear).
+const F_IP: usize = 0;
+const F_CHECK: usize = 1;
+const F_SIGNAL: usize = 2;
+const F_ADV: usize = 3; // the "Advanced" row
+const F_ADV_DD0: usize = 4; // Primaries .. MaxFALL are F_ADV_DD0 + 0..5 (only while Advanced is open)
+const F_DEFAULTS: usize = F_ADV_DD0 + (DD_COUNT - 1); // only while Advanced is open
+const F_CONNECT: usize = F_DEFAULTS + 1;
+const F_CANCEL: usize = F_CONNECT + 1;
+const F_COUNT: usize = F_CANCEL + 1;
+
+/// The focus stop of dropdown `i`.
+fn dd_focus_id(i: usize) -> usize {
+    if i == DD_SIGNAL {
+        F_SIGNAL
+    } else {
+        F_ADV_DD0 + i - 1
+    }
+}
+
+/// The dropdown a focus stop belongs to, if it is one.
+fn focus_dropdown(f: usize) -> Option<usize> {
+    if f == F_SIGNAL {
+        Some(DD_SIGNAL)
+    } else if (F_ADV_DD0..F_DEFAULTS).contains(&f) {
+        Some(f - F_ADV_DD0 + 1)
+    } else {
+        None
+    }
+}
 
 fn ip_rect() -> Rect {
     Rect::new(CTRL_X, IP_Y, CTRL_W as u32, ROW_H as u32)
@@ -150,7 +173,16 @@ fn check_hit_rect() -> Rect {
     Rect::new(CTRL_X, CHECK_Y, CTRL_W as u32, ROW_H as u32)
 }
 fn dd_rect(i: usize) -> Rect {
-    Rect::new(CTRL_X, DD_Y0 + i as i32 * DD_STEP, CTRL_W as u32, ROW_H as u32)
+    let y = if i == DD_SIGNAL { DD_Y0 } else { ADV_ROWS_Y0 + (i as i32 - 1) * DD_STEP };
+    Rect::new(CTRL_X, y, CTRL_W as u32, ROW_H as u32)
+}
+/// The "Advanced" label with its arrow: click it to open or close the section.
+fn adv_toggle_rect() -> Rect {
+    Rect::new(LABEL_X - 6, ADV_Y, (CTRL_X - 8 - (LABEL_X - 6)) as u32, ROW_H as u32)
+}
+/// Resets the menus inside "Advanced" to their defaults. Only there while Advanced is open.
+fn defaults_rect() -> Rect {
+    Rect::new(CTRL_X, ADV_Y, BTN_W as u32, ROW_H as u32)
 }
 /// Width of the arrow (preset list) zone at the right end of a menu.
 const ARROW_W: i32 = 36;
@@ -164,11 +196,20 @@ fn dd_arrow_zone(i: usize) -> Rect {
     let r = dd_rect(i);
     Rect::new(r.x() + CTRL_W - ARROW_W, r.y(), ARROW_W as u32, ROW_H as u32)
 }
-fn connect_rect() -> Rect {
-    Rect::new(CTRL_X + BTN_W + 14, BTN_Y, BTN_W as u32, BTN_H as u32)
+/// Top of the Connect / Cancel buttons, which sit below whatever is visible.
+fn buttons_y(advanced_open: bool) -> i32 {
+    let bottom = if advanced_open { dd_rect(DD_MAX_FALL).bottom() } else { ADV_Y + ROW_H };
+    bottom + 28
 }
-fn cancel_rect() -> Rect {
-    Rect::new(CTRL_X, BTN_Y, BTN_W as u32, BTN_H as u32)
+/// Height of the window: it grows when "Advanced" is opened and shrinks when it is closed.
+fn window_height(advanced_open: bool) -> i32 {
+    buttons_y(advanced_open) + BTN_H + 32
+}
+fn connect_rect(advanced_open: bool) -> Rect {
+    Rect::new(CTRL_X + BTN_W + 14, buttons_y(advanced_open), BTN_W as u32, BTN_H as u32)
+}
+fn cancel_rect(advanced_open: bool) -> Rect {
+    Rect::new(CTRL_X, buttons_y(advanced_open), BTN_W as u32, BTN_H as u32)
 }
 
 // -------------------------------------------------------------------------------------
@@ -358,6 +399,15 @@ impl Dropdown {
         }
     }
 
+    /// Set a numeric menu straight to `v` (limited to its range), ending any typing.
+    fn set_value(&mut self, v: f32) {
+        if let Some(n) = &mut self.numeric {
+            n.value = v.clamp(n.min, n.max);
+            n.editing = false;
+            n.buffer.clear();
+        }
+    }
+
     fn start_edit(&mut self) {
         if let Some(n) = &mut self.numeric {
             n.editing = true;
@@ -441,6 +491,8 @@ struct Form {
     /// The address is shown selected (a remembered or previously tried one): the first thing
     /// typed replaces it, Backspace clears it, Enter connects to it as it is.
     ip_selected: bool,
+    /// The "Advanced" section (Primaries and the four luminance numbers) is open.
+    advanced_open: bool,
     hdr_on: bool,
     support: HdrSupport,
     /// HDR modes behind the entries of the Signal menu (only the ones this system offers).
@@ -512,6 +564,7 @@ impl Form {
         Self {
             ip: defaults.remote.clone(),
             ip_selected: !defaults.remote.is_empty(),
+            advanced_open: false,
             hdr_on: support.any() && defaults.hdr != HdrMode::Sdr,
             support: support.clone(),
             signal_modes,
@@ -572,8 +625,71 @@ impl Form {
 
     /// The focused menu, if it is a numeric one that is currently usable.
     fn numeric_focus(&self) -> Option<usize> {
-        let i = self.focus.checked_sub(F_DD0).filter(|i| *i < DD_COUNT)?;
+        let i = focus_dropdown(self.focus)?;
         (self.dd_enabled() && self.dd[i].numeric.is_some()).then_some(i)
+    }
+
+    /// Height of the window for the current state.
+    fn height(&self) -> i32 {
+        window_height(self.advanced_open)
+    }
+
+    fn connect_rect(&self) -> Rect {
+        connect_rect(self.advanced_open)
+    }
+
+    fn cancel_rect(&self) -> Rect {
+        cancel_rect(self.advanced_open)
+    }
+
+    /// The menus that are on screen: Signal, plus the ones inside "Advanced" while it is open.
+    fn visible_dropdowns(&self) -> std::ops::Range<usize> {
+        0..if self.advanced_open { DD_COUNT } else { 1 }
+    }
+
+    /// Open or close the "Advanced" section (`None` toggles). Closing accepts anything being
+    /// typed and moves focus out of the section that is about to disappear.
+    fn set_advanced(&mut self, open: Option<bool>) {
+        if !self.support.any() {
+            return; // HDR cannot be used here, so there is nothing to show
+        }
+        let open = open.unwrap_or(!self.advanced_open);
+        if !open {
+            self.commit_edits();
+            self.close_all();
+            if (F_ADV_DD0..=F_DEFAULTS).contains(&self.focus) {
+                self.focus = F_ADV;
+            }
+        }
+        self.advanced_open = open;
+    }
+
+    /// Put the menus inside "Advanced" back to their defaults (Primaries and the four numbers).
+    /// The checkbox and the Signal menu are left alone.
+    fn reset_advanced(&mut self) {
+        let d = Settings::built_in();
+        self.close_all();
+        for dd in &mut self.dd {
+            dd.cancel_edit();
+        }
+        self.dd[DD_PRIMARIES].selected = if d.primaries == Primaries::P3D65 { 1 } else { 0 };
+        self.dd[DD_MAX_LUM].set_value(d.max_luminance);
+        self.dd[DD_MIN_LUM].set_value(d.min_luminance);
+        self.dd[DD_MAX_CLL].set_value(d.max_cll);
+        self.dd[DD_MAX_FALL].set_value(d.max_fall);
+    }
+
+    /// Does anything inside "Advanced" differ from its default? (Shown as a reminder while the
+    /// section is closed, so hidden values are never a surprise.)
+    fn advanced_differs_from_defaults(&self) -> bool {
+        let d = Settings::built_in();
+        let s = self.to_settings();
+        let differs = |a: f32, b: f32| (a - b).abs() > 1e-9;
+        s.primaries != d.primaries
+            || differs(s.max_luminance, d.max_luminance)
+            || differs(s.min_luminance, d.min_luminance)
+            || differs(s.max_cll, d.max_cll)
+            || differs(s.max_fall, d.max_fall)
     }
 
     fn open_dropdown(&self) -> Option<usize> {
@@ -584,7 +700,7 @@ impl Form {
     fn list_rect(&self, i: usize) -> Rect {
         let f = dd_rect(i);
         let h = self.dd[i].items.len() as i32 * ROW_H;
-        if f.bottom() + h <= H {
+        if f.bottom() + h <= self.height() {
             Rect::new(f.x(), f.bottom(), CTRL_W as u32, h as u32)
         } else {
             Rect::new(f.x(), f.y() - h, CTRL_W as u32, h as u32)
@@ -597,10 +713,13 @@ impl Form {
     }
 
     fn focusable(&self, f: usize) -> bool {
-        if f == F_CHECK {
-            return self.support.any();
+        match f {
+            F_CHECK | F_ADV => self.support.any(),
+            F_SIGNAL => self.dd_enabled(),
+            F_DEFAULTS => self.advanced_open && self.dd_enabled(),
+            _ if focus_dropdown(f).is_some() => self.advanced_open && self.dd_enabled(),
+            _ => true,
         }
-        !(F_DD0..F_DD0 + DD_COUNT).contains(&f) || self.dd_enabled()
     }
 
     fn move_focus(&mut self, dir: i32) {
@@ -652,6 +771,16 @@ impl Form {
         match f {
             F_CONNECT => self.submit(),
             F_CANCEL => Action::Cancel,
+            F_ADV => {
+                self.set_advanced(None);
+                Action::None
+            }
+            F_DEFAULTS => {
+                if self.dd_enabled() {
+                    self.reset_advanced();
+                }
+                Action::None
+            }
             _ => Action::None,
         }
     }
@@ -711,15 +840,25 @@ impl Form {
                 self.focus = F_CHECK;
                 self.toggle_hdr(None);
             }
-        } else if connect_rect().contains_point(p) {
+        } else if self.connect_rect().contains_point(p) {
             self.focus = F_CONNECT;
             return self.submit();
-        } else if cancel_rect().contains_point(p) {
+        } else if self.cancel_rect().contains_point(p) {
             return Action::Cancel;
+        } else if adv_toggle_rect().contains_point(p) {
+            if self.support.any() {
+                self.focus = F_ADV;
+                self.set_advanced(None);
+            }
+        } else if self.advanced_open && defaults_rect().contains_point(p) {
+            if self.dd_enabled() {
+                self.focus = F_DEFAULTS;
+                self.reset_advanced();
+            }
         } else if self.dd_enabled() {
-            for i in 0..DD_COUNT {
+            for i in self.visible_dropdowns() {
                 if dd_rect(i).contains_point(p) {
-                    self.focus = F_DD0 + i;
+                    self.focus = dd_focus_id(i);
                     if self.dd[i].numeric.is_some() && dd_text_zone(i).contains_point(p) {
                         self.dd[i].start_edit(); // the number: type a value
                     } else {
@@ -735,7 +874,7 @@ impl Form {
     fn handle_key(&mut self, key: Keycode, keymod: Mod) -> Action {
         let ctrl = keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD);
         let shift = keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
-        let dd_focus = (F_DD0..F_DD0 + DD_COUNT).contains(&self.focus).then(|| self.focus - F_DD0);
+        let dd_focus = focus_dropdown(self.focus);
 
         // While a number is being typed, these keys belong to the number.
         if let Some(i) = self.editing_dropdown() {
@@ -776,8 +915,9 @@ impl Form {
                 if self.open_dropdown().is_some() {
                     self.close_all();
                     Action::None
-                } else if self.focus == F_CANCEL {
-                    Action::Cancel
+                } else if matches!(self.focus, F_CANCEL | F_ADV | F_DEFAULTS) {
+                    // these are buttons: Enter presses the focused one (Enter anywhere else connects)
+                    self.activate(self.focus)
                 } else {
                     self.submit()
                 }
@@ -785,7 +925,7 @@ impl Form {
             Keycode::Space => {
                 match self.focus {
                     F_CHECK => self.toggle_hdr(None),
-                    F_CONNECT | F_CANCEL => return self.activate(self.focus),
+                    F_CONNECT | F_CANCEL | F_ADV | F_DEFAULTS => return self.activate(self.focus),
                     _ => {
                         if let Some(i) = dd_focus {
                             let open = self.dd[i].open;
@@ -869,6 +1009,11 @@ fn draw_text_scaled<T: RenderTarget>(c: &mut Canvas<T>, x: i32, y: i32, s: &str,
     }
 }
 
+const ADVANCED_LABEL: &str = "Advanced";
+const DEFAULTS_LABEL: &str = "Defaults";
+/// Shown (small, next to a closed "Advanced") when a value inside it is not at its default.
+const ADVANCED_CHANGED: &str = "Custom HDR values are set";
+
 /// Shown in red under the IP field when Connect is pressed with it empty.
 const IP_REQUIRED: &str = "IP address needed";
 
@@ -891,6 +1036,20 @@ fn draw_box<T: RenderTarget>(c: &mut Canvas<T>, r: Rect, fill: Color, border: Co
     c.set_draw_color(fill);
     let _ = c.fill_rect(r);
     outline(c, r, border);
+}
+
+/// Disclosure triangle for the "Advanced" row: pointing right when closed, down when open.
+/// 12x12 pixels with its top-left corner at (x, y).
+fn draw_disclosure<T: RenderTarget>(c: &mut Canvas<T>, x: i32, y: i32, open: bool, color: Color) {
+    c.set_draw_color(color);
+    for i in 0..6 {
+        let len = (12 - 2 * i) as u32;
+        let _ = if open {
+            c.fill_rect(Rect::new(x + i, y + i, len, 1))
+        } else {
+            c.fill_rect(Rect::new(x + i, y + i, 1, len))
+        };
+    }
 }
 
 /// Small downward-pointing triangle centred on (cx, cy).
@@ -957,11 +1116,12 @@ fn draw_form<T: RenderTarget>(c: &mut Canvas<T>, f: &Form) {
 
     // ---- dropdown fields ------------------------------------------------------------
     let enabled = f.dd_enabled();
-    for (i, d) in f.dd.iter().enumerate() {
+    for i in f.visible_dropdowns() {
+        let d = &f.dd[i];
         let r = dd_rect(i);
         let text_col = if enabled { TEXT } else { MUTED };
         draw_label(c, LABEL_X, r.y(), d.label, text_col);
-        let border = if enabled && f.focus == F_DD0 + i { FOCUS } else { BORDER };
+        let border = if enabled && f.focus == dd_focus_id(i) { FOCUS } else { BORDER };
         draw_box(c, r, FIELD, border);
         match &d.numeric {
             None => {
@@ -994,13 +1154,38 @@ fn draw_form<T: RenderTarget>(c: &mut Canvas<T>, f: &Form) {
         }
     }
 
+    // ---- "Advanced": a disclosure row; while open it also has the Defaults button -----------------
+    let adv_ok = f.support.any();
+    let adv_col = if adv_ok { TEXT } else { MUTED };
+    let toggle = adv_toggle_rect();
+    if adv_ok && f.focus == F_ADV {
+        outline(c, toggle, FOCUS);
+    }
+    draw_disclosure(c, LABEL_X, ADV_Y + (ROW_H - 12) / 2, f.advanced_open, adv_col);
+    draw_label(c, LABEL_X + 22, ADV_Y, ADVANCED_LABEL, adv_col);
+    if f.advanced_open {
+        let button = defaults_rect();
+        let live = f.dd_enabled();
+        draw_box(c, button, FIELD, if live && f.focus == F_DEFAULTS { FOCUS } else { BORDER });
+        draw_text(
+            c,
+            button.x() + (BTN_W - text_width(DEFAULTS_LABEL)) / 2,
+            button.y() + (ROW_H - GLYPH) / 2,
+            DEFAULTS_LABEL,
+            if live { TEXT } else { MUTED },
+        );
+    } else if adv_ok && f.advanced_differs_from_defaults() {
+        // closed, but something inside is not at its default: say so
+        draw_text_scaled(c, CTRL_X, ADV_Y + (ROW_H - 8) / 2, ADVANCED_CHANGED, NOTE_WARN, 1);
+    }
+
     // ---- buttons --------------------------------------------------------------------
-    let cancel = cancel_rect();
+    let cancel = f.cancel_rect();
     draw_box(c, cancel, FIELD, if f.focus == F_CANCEL { FOCUS } else { BORDER });
     let label = "Cancel";
     draw_text(c, cancel.x() + (BTN_W - text_width(label)) / 2, cancel.y() + (BTN_H - GLYPH) / 2, label, TEXT);
 
-    let connect = connect_rect();
+    let connect = f.connect_rect();
     draw_box(c, connect, ACCENT, if f.focus == F_CONNECT { TEXT } else { ACCENT });
     let label = "Connect";
     draw_text(c, connect.x() + (BTN_W - text_width(label)) / 2, connect.y() + (BTN_H - GLYPH) / 2, label, TEXT);
@@ -1033,19 +1218,32 @@ fn draw_form<T: RenderTarget>(c: &mut Canvas<T>, f: &Form) {
 pub fn show(defaults: Settings, support: &HdrSupport) -> Result<Option<Settings>, String> {
     let sdl = sdl2::init()?;
     let video = sdl.video()?;
+    let form = Form::new(&defaults, support);
+    let mut applied_height = form.height();
     let window = video
-        .window("Calibration Client Linux", W as u32, H as u32)
+        .window("Calibration Client Linux", W as u32, applied_height as u32)
         .position_centered()
+        // Resizable so the window can follow the "Advanced" section on every backend (a window
+        // with a fixed size may refuse to change it); the minimum size below stops it ever being
+        // made too small for what is on screen.
+        .resizable()
         .build()
         .map_err(|e| e.to_string())?;
     // The software renderer is plenty for a static form and avoids any GPU/driver setup.
     let mut canvas = window.into_canvas().software().build().map_err(|e| e.to_string())?;
+    let _ = canvas.window_mut().set_minimum_size(W as u32, applied_height as u32);
     let mut pump = sdl.event_pump()?;
     let text_input = video.text_input();
     text_input.start();
 
-    let mut form = Form::new(&defaults, support);
+    let mut form = form;
     loop {
+        // "Advanced" opening or closing changes how much window is needed.
+        if form.height() != applied_height {
+            applied_height = form.height();
+            let _ = canvas.window_mut().set_minimum_size(W as u32, applied_height as u32);
+            let _ = canvas.window_mut().set_size(W as u32, applied_height as u32);
+        }
         draw_form(&mut canvas, &form);
         canvas.present();
 
@@ -1105,12 +1303,26 @@ mod tests {
         form.handle_event(&Event::TextInput { timestamp: 0, window_id: 0, text: text.to_string() });
     }
 
-    /// A form with HDR ticked and an IP entered.
+    /// A form with HDR ticked, an IP entered and the "Advanced" section open (most tests here
+    /// work on the menus inside it).
     fn hdr_form() -> Form {
         let mut d = defaults();
         d.remote = "10.0.0.2".into();
         d.hdr = HdrMode::Hdr10;
-        Form::new(&d, &full())
+        let mut form = Form::new(&d, &full());
+        form.advanced_open = true;
+        form
+    }
+
+    /// The buttons move with the "Advanced" section, so ask the form where they are.
+    fn click_connect(form: &mut Form) -> Action {
+        let r = form.connect_rect();
+        click(form, r)
+    }
+
+    fn click_cancel(form: &mut Form) -> Action {
+        let r = form.cancel_rect();
+        click(form, r)
     }
 
     fn key(form: &mut Form, k: Keycode) -> Action {
@@ -1175,11 +1387,11 @@ mod tests {
     #[test]
     fn connect_needs_an_ip() {
         let mut form = Form::new(&defaults(), &full());
-        assert_eq!(click(&mut form, connect_rect()), Action::None);
+        assert_eq!(click_connect(&mut form), Action::None);
         assert!(form.ip_error);
         form.insert_text("10.0.0.2");
-        assert_eq!(click(&mut form, connect_rect()), Action::Submit);
-        assert_eq!(click(&mut form, cancel_rect()), Action::Cancel);
+        assert_eq!(click_connect(&mut form), Action::Submit);
+        assert_eq!(click_cancel(&mut form), Action::Cancel);
     }
 
     #[test]
@@ -1197,10 +1409,11 @@ mod tests {
 
     #[test]
     fn lists_stay_inside_the_window() {
-        let form = Form::new(&defaults(), &full());
+        let mut form = Form::new(&defaults(), &full());
+        form.advanced_open = true;
         for i in 0..DD_COUNT {
             let l = form.list_rect(i);
-            assert!(l.y() >= 0 && l.bottom() <= H, "dropdown {i} list at {l:?}");
+            assert!(l.y() >= 0 && l.bottom() <= form.height(), "dropdown {i} list at {l:?}");
         }
     }
 
@@ -1263,6 +1476,7 @@ mod tests {
         let mut d = defaults();
         d.apply_saved(&remembered());
         let mut form = Form::new(&d, &full());
+        click(&mut form, adv_toggle_rect()); // open "Advanced", as a user would
         click(&mut form, check_hit_rect()); // untick
         click(&mut form, dd_text_zone(DD_MAX_LUM)); // type a number (unlocked again by re-ticking)
         click(&mut form, check_hit_rect()); // tick again
@@ -1303,6 +1517,199 @@ mod tests {
 
         // and when HDR is usable again, the forced-off value would have been the bug
         assert_ne!(settings.to_saved(true, &before).hdr_enabled, before.hdr_enabled);
+    }
+
+    /// The focus stops reached by pressing Tab repeatedly from the address field.
+    fn tab_order(form: &mut Form, presses: usize) -> Vec<usize> {
+        form.focus = F_IP;
+        (0..presses)
+            .map(|_| {
+                key(form, Keycode::Tab);
+                form.focus
+            })
+            .collect()
+    }
+
+    #[test]
+    fn advanced_starts_closed_and_hidden_menus_ignore_clicks() {
+        let mut form = Form::new(&{ let mut d = defaults(); d.hdr = HdrMode::Hdr10; d }, &full());
+        assert!(!form.advanced_open);
+        let closed_height = form.height();
+
+        click(&mut form, dd_text_zone(DD_MAX_LUM));
+        click(&mut form, dd_rect(DD_PRIMARIES));
+        assert!(!form.dd[DD_MAX_LUM].is_editing());
+        assert!(form.open_dropdown().is_none(), "a menu that is not on screen cannot be opened");
+
+        click(&mut form, adv_toggle_rect());
+        assert!(form.advanced_open);
+        assert!(form.height() > closed_height, "the window grows");
+        click(&mut form, dd_text_zone(DD_MAX_LUM));
+        assert!(form.dd[DD_MAX_LUM].is_editing(), "and now the fields respond");
+
+        click(&mut form, adv_toggle_rect());
+        assert!(!form.advanced_open);
+        assert_eq!(form.height(), closed_height, "the window shrinks back");
+    }
+
+    #[test]
+    fn advanced_opens_and_closes_from_the_keyboard_without_connecting() {
+        let mut form = Form::new(&{ let mut d = defaults(); d.hdr = HdrMode::Hdr10; d.remote = "10.0.0.2".into(); d }, &full());
+        form.focus = F_ADV;
+        assert_eq!(key(&mut form, Keycode::Space), Action::None);
+        assert!(form.advanced_open);
+        assert_eq!(key(&mut form, Keycode::Return), Action::None, "Enter on the row presses it, it does not connect");
+        assert!(!form.advanced_open);
+        assert_eq!(key(&mut form, Keycode::Return), Action::None);
+        assert!(form.advanced_open);
+    }
+
+    #[test]
+    fn tab_follows_the_order_on_screen() {
+        let mut d = defaults();
+        d.hdr = HdrMode::Hdr10;
+        let mut form = Form::new(&d, &full());
+        // closed: the hidden menus and the Defaults button are skipped
+        assert_eq!(
+            tab_order(&mut form, 6),
+            vec![F_CHECK, F_SIGNAL, F_ADV, F_CONNECT, F_CANCEL, F_IP]
+        );
+        // open: they come right after the "Advanced" row
+        form.advanced_open = true;
+        let mut expected = vec![F_CHECK, F_SIGNAL, F_ADV];
+        expected.extend((1..DD_COUNT).map(dd_focus_id));
+        expected.extend([F_DEFAULTS, F_CONNECT, F_CANCEL, F_IP]);
+        assert_eq!(tab_order(&mut form, expected.len()), expected);
+    }
+
+    #[test]
+    fn closing_advanced_accepts_typing_and_moves_focus_out() {
+        let mut form = hdr_form();
+        click(&mut form, dd_text_zone(DD_MAX_LUM));
+        typed(&mut form, "1500");
+        click(&mut form, adv_toggle_rect());
+        assert!(!form.advanced_open);
+        assert!(!form.dd[DD_MAX_LUM].is_editing());
+        assert_eq!(form.to_settings().max_luminance, 1500.0, "a hidden value still applies");
+        assert_eq!(form.focus, F_ADV);
+
+        // focus inside the section when it closes goes to the "Advanced" row too
+        form.advanced_open = true;
+        form.focus = dd_focus_id(DD_MIN_LUM);
+        form.set_advanced(Some(false));
+        assert_eq!(form.focus, F_ADV);
+        // and focus elsewhere stays where it is
+        form.advanced_open = true;
+        form.focus = F_SIGNAL;
+        form.set_advanced(Some(false));
+        assert_eq!(form.focus, F_SIGNAL);
+    }
+
+    #[test]
+    fn the_defaults_button_resets_only_the_advanced_values() {
+        let mut d = defaults();
+        d.apply_saved(&remembered()); // HLG, P3-D65, 1200 / 0.0005 / 1000 / 400, HDR ticked
+        let mut form = Form::new(&d, &full());
+        let defaults_position = defaults_rect();
+
+        // the button only exists while "Advanced" is open
+        click(&mut form, defaults_position);
+        assert_eq!(form.to_settings().max_luminance, 1200.0, "closed: nothing there to press");
+
+        click(&mut form, adv_toggle_rect());
+        click(&mut form, dd_text_zone(DD_MIN_LUM));
+        typed(&mut form, "0.05"); // half-typed when the button is pressed
+        click(&mut form, defaults_position);
+
+        let s = form.to_settings();
+        assert_eq!(s.primaries, Primaries::Bt2020);
+        assert_eq!((s.max_luminance, s.min_luminance, s.max_cll, s.max_fall), (1000.0, 0.0001, 0.0, 0.0));
+        assert!(!form.dd[DD_MIN_LUM].is_editing(), "typing in progress is dropped");
+        // everything outside "Advanced" is untouched
+        assert_eq!((s.hdr, s.signal), (HdrMode::Hlg, HdrMode::Hlg));
+        assert_eq!(form.ip, "192.168.1.5");
+        assert!(form.advanced_open, "and the section stays open");
+
+        // it also works from the keyboard, without connecting
+        form.dd[DD_MAX_LUM].set_value(2000.0);
+        form.focus = F_DEFAULTS;
+        assert_eq!(key(&mut form, Keycode::Return), Action::None);
+        assert_eq!(form.to_settings().max_luminance, 1000.0);
+        form.dd[DD_MAX_LUM].set_value(2000.0);
+        assert_eq!(key(&mut form, Keycode::Space), Action::None);
+        assert_eq!(form.to_settings().max_luminance, 1000.0);
+    }
+
+    #[test]
+    fn the_defaults_button_does_nothing_while_hdr_is_off() {
+        let mut d = defaults();
+        d.apply_saved(&remembered());
+        d.hdr = HdrMode::Sdr; // HDR unticked (available, just off)
+        let mut form = Form::new(&d, &full());
+        assert!(!form.hdr_on);
+        click(&mut form, adv_toggle_rect());
+        assert!(form.advanced_open, "the section can be looked at");
+        click(&mut form, defaults_rect());
+        assert_eq!(form.to_settings().max_luminance, 1200.0, "but its values are locked until HDR is ticked");
+        assert!(!form.focusable(F_DEFAULTS));
+    }
+
+    #[test]
+    fn a_closed_advanced_section_says_when_it_holds_custom_values() {
+        let mut form = Form::new(&defaults(), &full());
+        assert!(!form.advanced_differs_from_defaults());
+
+        let mut d = defaults();
+        d.apply_saved(&remembered());
+        let mut form = Form::new(&d, &full());
+        assert!(form.advanced_differs_from_defaults());
+        click(&mut form, adv_toggle_rect());
+        click(&mut form, defaults_rect());
+        assert!(!form.advanced_differs_from_defaults(), "after Defaults there is nothing to flag");
+
+        // typing the default value is not a difference
+        click(&mut form, dd_text_zone(DD_MAX_LUM));
+        typed(&mut form, "1000");
+        key(&mut form, Keycode::Return);
+        assert!(!form.advanced_differs_from_defaults());
+        // each hidden value counts
+        for (dd, value) in [(DD_MAX_LUM, 999.0), (DD_MIN_LUM, 0.001), (DD_MAX_CLL, 1.0), (DD_MAX_FALL, 1.0)] {
+            let mut f = Form::new(&defaults(), &full());
+            f.dd[dd].set_value(value);
+            assert!(f.advanced_differs_from_defaults(), "menu {dd}");
+        }
+        let mut f = Form::new(&defaults(), &full());
+        f.dd[DD_PRIMARIES].selected = 1;
+        assert!(f.advanced_differs_from_defaults(), "primaries");
+    }
+
+    #[test]
+    fn advanced_is_unavailable_where_hdr_is() {
+        for support in [none(), HdrSupport { kde_no_hdr_display: true, ..full() }] {
+            let mut form = Form::new(&defaults(), &support);
+            click(&mut form, adv_toggle_rect());
+            assert!(!form.advanced_open, "nothing to show without HDR: {support:?}");
+            form.focus = F_ADV;
+            key(&mut form, Keycode::Space);
+            assert!(!form.advanced_open);
+            assert!(!form.focusable(F_ADV));
+        }
+    }
+
+    #[test]
+    fn the_window_fits_what_is_showing() {
+        for open in [false, true] {
+            let h = window_height(open);
+            for r in [connect_rect(open), cancel_rect(open)] {
+                assert!(r.bottom() < h && r.y() > 0, "buttons inside a {h}px window (open={open})");
+            }
+            let last_menu = dd_rect(if open { DD_MAX_FALL } else { DD_SIGNAL });
+            assert!(last_menu.bottom() < connect_rect(open).y(), "menus stay above the buttons (open={open})");
+        }
+        assert!(window_height(true) > window_height(false));
+        // the Defaults button sits in the "Advanced" row, clear of its label
+        assert!(defaults_rect().x() >= adv_toggle_rect().right());
+        assert_eq!(defaults_rect().y(), adv_toggle_rect().y());
     }
 
     #[test]
@@ -1466,14 +1873,14 @@ mod tests {
     #[test]
     fn numbers_can_be_typed_from_the_keyboard_and_arrows_step_presets() {
         let mut form = hdr_form();
-        form.focus = F_DD0 + DD_MAX_FALL;
+        form.focus = dd_focus_id(DD_MAX_FALL);
         typed(&mut form, "300"); // no click needed once the field has focus
         assert!(form.dd[DD_MAX_FALL].is_editing());
-        key(&mut form, Keycode::Tab); // accepts it and moves on
+        key(&mut form, Keycode::Tab); // accepts it and moves on (to the Defaults button)
         assert_eq!(form.to_settings().max_fall, 300.0);
-        assert_eq!(form.focus, F_CONNECT);
+        assert_eq!(form.focus, F_DEFAULTS);
 
-        form.focus = F_DD0 + DD_MAX_LUM; // 1000
+        form.focus = dd_focus_id(DD_MAX_LUM); // 1000
         key(&mut form, Keycode::Down);
         assert_eq!(form.to_settings().max_luminance, 2000.0);
         key(&mut form, Keycode::Up);
@@ -1490,7 +1897,7 @@ mod tests {
         let mut form = hdr_form();
         click(&mut form, dd_text_zone(DD_MAX_LUM));
         typed(&mut form, "1500");
-        assert_eq!(click(&mut form, connect_rect()), Action::Submit);
+        assert_eq!(click_connect(&mut form), Action::Submit);
         assert_eq!(form.to_settings().max_luminance, 1500.0);
     }
 
@@ -1500,7 +1907,7 @@ mod tests {
         d.remote = "10.0.0.2".into();
         let mut form = Form::new(&d, &full()); // HDR unticked
         click(&mut form, dd_text_zone(DD_MAX_LUM));
-        form.focus = F_DD0 + DD_MAX_LUM;
+        form.focus = dd_focus_id(DD_MAX_LUM);
         typed(&mut form, "1200");
         assert!(!form.dd[DD_MAX_LUM].is_editing());
         assert_eq!(form.to_settings().max_luminance, 1000.0);
@@ -1608,6 +2015,11 @@ mod tests {
         let typing = 8 + text_width(&"8".repeat(MAX_TYPED_CHARS)) + 8 + text_width("cd/m2");
         assert!(typing <= CTRL_W - ARROW_W - 4, "typing area needs {typing}px");
 
+        // the "Advanced" row: arrow + label in the label column, the button and the reminder
+        assert!(LABEL_X + 22 + text_width(ADVANCED_LABEL) <= CTRL_X - 8, "Advanced label");
+        assert!(text_width(DEFAULTS_LABEL) + 8 <= BTN_W, "Defaults label fits its button");
+        assert!(CTRL_X + ADVANCED_CHANGED.chars().count() as i32 * 8 <= W - LABEL_X, "custom-values reminder");
+
         // labels fit their column and menu entries fit the menu (leaving room for the arrow)
         let form = Form::new(&defaults(), &full());
         for d in &form.dd {
@@ -1623,7 +2035,7 @@ mod tests {
     #[ignore]
     fn render_preview() {
         let render = |name: &str, form: &Form| {
-            let surface = Surface::new(W as u32, H as u32, PixelFormatEnum::RGB24).unwrap();
+            let surface = Surface::new(W as u32, form.height() as u32, PixelFormatEnum::RGB24).unwrap();
             let mut canvas = surface.into_canvas().unwrap();
             draw_form(&mut canvas, form);
             canvas.into_surface().save_bmp(format!("/tmp/startup_{name}.bmp")).unwrap();
@@ -1633,11 +2045,27 @@ mod tests {
         d.remote = "192.168.168.207".into();
         d.hdr = HdrMode::Hdr10;
         let mut form = Form::new(&d, &full());
-        render("supported", &form);
+        render("adv_closed", &form);
+
+        // closed, with custom values inside: the reminder
+        let mut custom = d.clone();
+        custom.apply_saved(&remembered());
+        let mut form_custom = Form::new(&custom, &full());
+        form_custom.ip_selected = false;
+        render("adv_closed_custom", &form_custom);
+
+        form.advanced_open = true;
+        render("adv_open", &form);
         form.dd[DD_MAX_LUM].open = true;
         form.mouse = form.item_rect(DD_MAX_LUM, 1).center();
-        render("open", &form);
+        render("adv_open_list", &form);
+        form.close_all();
+        form.focus = dd_focus_id(DD_MAX_LUM);
+        form.dd[DD_MAX_LUM].type_chars("1200");
+        form.dd[DD_MIN_LUM].start_edit(); // empty edit: shows the current value greyed
+        render("typing", &form);
 
+        // HDR unavailable / off: the Advanced row is greyed out
         let mut empty = defaults();
         empty.hdr = HdrMode::Hdr10;
         let mut form = Form::new(&empty, &none());
@@ -1646,11 +2074,5 @@ mod tests {
         render("unsupported_x11", &Form::new(&d, &HdrSupport { driver: "x11".into(), ..none() }));
         render("kde_off", &Form::new(&d, &HdrSupport { kde_hdr_off: true, ..full() }));
         render("kde_no_display", &Form::new(&d, &HdrSupport { kde_no_hdr_display: true, ..full() }));
-
-        let mut form = Form::new(&d, &full());
-        form.focus = F_DD0 + DD_MAX_LUM;
-        form.dd[DD_MAX_LUM].type_chars("1200");
-        form.dd[DD_MIN_LUM].start_edit(); // empty edit: shows the current value greyed
-        render("typing", &form);
     }
 }
