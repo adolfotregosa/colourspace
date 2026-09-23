@@ -12,5 +12,6 @@ thiserror = "^2"
 quick-xml = "^0"
 argh = "^0"
 tinyfiledialogs = "3.2"
+socket2 = { version = "0.5", features = ["all"] }
 ash = "0.38"
 font8x8 = "0.3"

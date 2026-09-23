@@ -18,6 +18,7 @@ use ash::vk::Handle;
 use ash::{ext, khr, vk, Entry, StaticFn};
 use sdl2::video::Window;
 use std::ffi::{c_char, CStr, CString};
+use std::time::{Duration, Instant};
 
 use crate::lan::ColorRGB;
 
@@ -48,6 +49,19 @@ pub enum HdrMode {
 }
 
 impl HdrMode {
+    /// The word used on the command line and in the saved settings.
+    pub fn key(self) -> &'static str {
+        match self {
+            HdrMode::Sdr => "sdr",
+            HdrMode::Hdr10 => "hdr10",
+            HdrMode::Hlg => "hlg",
+        }
+    }
+
+    pub fn from_key(text: &str) -> Option<Self> {
+        <Self as argh::FromArgValue>::from_arg_value(text).ok()
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             HdrMode::Sdr => "SDR",
@@ -73,6 +87,20 @@ impl argh::FromArgValue for HdrMode {
 pub enum Primaries {
     Bt2020,
     P3D65,
+}
+
+impl Primaries {
+    /// The word used on the command line and in the saved settings.
+    pub fn key(self) -> &'static str {
+        match self {
+            Primaries::Bt2020 => "bt2020",
+            Primaries::P3D65 => "p3d65",
+        }
+    }
+
+    pub fn from_key(text: &str) -> Option<Self> {
+        <Self as argh::FromArgValue>::from_arg_value(text).ok()
+    }
 }
 
 impl argh::FromArgValue for Primaries {
@@ -149,6 +177,282 @@ pub fn color_to_unit_rgb(color: ColorRGB) -> [f32; 3] {
     [n(color.red), n(color.green), n(color.blue)]
 }
 
+/// When must the swapchain be (re)built?
+///
+/// * the window's drawable size changed since it was created, or
+/// * there is no swapchain (window was minimised) - retried at most every 100 ms, because a
+///   minimise/restore does not always change the reported size.
+///
+/// Comparing against the size the swapchain was *requested* at (not `current_extent`) matters:
+/// on some platforms the surface reports a fixed extent that differs from SDL's drawable size,
+/// and comparing against that would rebuild the swapchain on every single frame.
+fn rebuild_needed(
+    drawable: (u32, u32),
+    requested: (u32, u32),
+    have_swapchain: bool,
+    since_last_rebuild: Duration,
+) -> bool {
+    drawable != requested || (!have_swapchain && since_last_rebuild >= Duration::from_millis(100))
+}
+
+// -------------------------------------------------------------------------------------
+// Availability check (used by the startup window)
+// -------------------------------------------------------------------------------------
+
+/// Which HDR outputs this system can really provide, as found by `probe`.
+#[derive(Debug, Clone, Default)]
+pub struct HdrSupport {
+    pub hdr10: bool,
+    pub hlg: bool,
+    /// SDL video driver the check ran on ("wayland", "x11", ...).
+    pub driver: String,
+    /// Set when the check itself could not be completed (no Vulkan, no window, ...).
+    pub problem: Option<String>,
+    /// KDE reports that HDR is switched off in the display settings. Vulkan cannot tell:
+    /// KWin still offers HDR10 surfaces on such a display (it tone-maps them to SDR), so
+    /// a measurement would silently be taken from a converted SDR signal.
+    pub kde_hdr_off: bool,
+}
+
+impl HdrSupport {
+    /// Can an HDR window be used (and trusted) here?
+    pub fn any(&self) -> bool {
+        (self.hdr10 || self.hlg) && !self.kde_hdr_off
+    }
+}
+
+/// Remove ANSI colour sequences (kscreen-doctor colours its output).
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for n in chars.by_ref() {
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Read the HDR state out of `kscreen-doctor -o` (text, "HDR: enabled") or `-j` (JSON,
+/// `"hdr": true`) output. `Some(true)` if any display has HDR on, `Some(false)` if displays
+/// report it and all are off, `None` if the output says nothing usable (fail-safe: unknown).
+fn parse_kde_hdr_state(text: &str) -> Option<bool> {
+    let clean = strip_ansi(text).to_lowercase();
+    let (mut on, mut off) = (false, false);
+    for key in ["hdr:", "\"hdr\":"] {
+        let mut rest = clean.as_str();
+        while let Some(pos) = rest.find(key) {
+            rest = &rest[pos + key.len()..];
+            let word: String = rest.trim_start().chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+            match word.as_str() {
+                "enabled" | "true" => on = true,
+                "disabled" | "false" => off = true,
+                _ => {} // e.g. "incapable"
+            }
+        }
+    }
+    if on {
+        Some(true)
+    } else if off {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Ask KDE whether HDR is enabled. `run` executes `kscreen-doctor` with the given arguments
+/// and returns everything it printed. Only KDE sessions are asked.
+fn kde_hdr_state_with(desktop: &str, run: impl Fn(&[&str]) -> Option<String>) -> Option<bool> {
+    if !desktop.to_lowercase().contains("kde") {
+        return None;
+    }
+    for args in [&["-o"][..], &["-j"][..]] {
+        if let Some(state) = run(args).and_then(|text| parse_kde_hdr_state(&text)) {
+            return Some(state);
+        }
+    }
+    None
+}
+
+/// Run `kscreen-doctor`, giving up after a few seconds. Its text output goes through Qt's
+/// logging, i.e. stderr, so both streams are returned.
+fn run_kscreen_doctor(args: &[&str]) -> Option<String> {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = std::process::Command::new("kscreen-doctor")
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .output();
+        let _ = tx.send(out);
+    });
+    match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(out)) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push('\n');
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
+/// 10-bit formats the presenter can use.
+const HDR_FORMATS: [vk::Format; 2] = [
+    vk::Format::A2B10G10R10_UNORM_PACK32, // preferred: NVIDIA can scan this out directly
+    vk::Format::A2R10G10B10_UNORM_PACK32,
+];
+
+/// (HDR10 PQ offered, HLG offered) among a surface's formats.
+fn classify_formats(formats: &[vk::SurfaceFormatKHR]) -> (bool, bool) {
+    let offers = |space: vk::ColorSpaceKHR| {
+        formats.iter().any(|f| HDR_FORMATS.contains(&f.format) && f.color_space == space)
+    };
+    (offers(vk::ColorSpaceKHR::HDR10_ST2084_EXT), offers(vk::ColorSpaceKHR::HDR10_HLG_EXT))
+}
+
+/// HDR needs the native Wayland SDL driver (XWayland has no HDR). Ask for it unless the user
+/// chose a driver explicitly. Must run before SDL is initialised.
+pub fn prefer_wayland_driver() {
+    if std::env::var_os("SDL_VIDEODRIVER").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        sdl2::hint::set("SDL_VIDEODRIVER", "wayland");
+    }
+}
+
+/// Find out whether an HDR10 / HLG window can be created here, without showing anything:
+/// open a small hidden Vulkan window on the driver HDR would use and ask which surface
+/// formats it is offered. Uses (and fully releases) its own SDL context.
+pub fn probe() -> HdrSupport {
+    prefer_wayland_driver();
+    let mut support = match probe_inner() {
+        Ok(support) => support,
+        Err(problem) => HdrSupport { problem: Some(problem), ..Default::default() },
+    };
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    let kde_state = if support.hdr10 || support.hlg {
+        kde_hdr_state_with(&desktop, run_kscreen_doctor)
+    } else {
+        None
+    };
+    support.kde_hdr_off = kde_state == Some(false);
+    eprintln!(
+        "HDR check: HDR10={} HLG={} (SDL driver: {}){}{}",
+        support.hdr10,
+        support.hlg,
+        if support.driver.is_empty() { "?" } else { &support.driver },
+        match kde_state {
+            Some(true) => ", KDE display HDR: on",
+            Some(false) => ", KDE display HDR: OFF",
+            None if desktop.to_lowercase().contains("kde") => ", KDE display HDR: unknown",
+            None => "",
+        },
+        support.problem.as_ref().map(|p| format!(", problem: {p}")).unwrap_or_default()
+    );
+    support
+}
+
+fn probe_inner() -> Result<HdrSupport, String> {
+    let vk_err = |e: vk::Result| format!("Vulkan error: {e}");
+
+    let sdl = sdl2::init()?;
+    let video = sdl.video()?;
+    let mut support = HdrSupport { driver: video.current_video_driver().to_string(), ..Default::default() };
+    let window = video
+        .window("HDR check", 64, 64)
+        .vulkan()
+        .hidden()
+        .build()
+        .map_err(|e| format!("cannot create a Vulkan window: {e}"))?;
+
+    let entry = unsafe {
+        let ptr = window
+            .subsystem()
+            .vulkan_get_proc_address_function()
+            .map_err(|e| format!("no Vulkan loader: {e}"))?;
+        let get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr = std::mem::transmute(ptr);
+        Entry::from_static_fn(StaticFn { get_instance_proc_addr })
+    };
+
+    let sdl_exts = window.vulkan_instance_extensions().map_err(|e| format!("SDL Vulkan extensions: {e}"))?;
+    let mut ext_names: Vec<CString> = sdl_exts.iter().map(|s| CString::new(*s).unwrap()).collect();
+    let available = unsafe { entry.enumerate_instance_extension_properties(None) }.map_err(vk_err)?;
+    let has_colourspace_ext = available.iter().any(|e| {
+        e.extension_name_as_c_str().map(|n| n == ext::swapchain_colorspace::NAME).unwrap_or(false)
+    });
+    if !has_colourspace_ext {
+        support.problem = Some("the Vulkan driver lacks VK_EXT_swapchain_colorspace".to_string());
+        return Ok(support);
+    }
+    ext_names.push(ext::swapchain_colorspace::NAME.to_owned());
+    let ext_ptrs: Vec<*const c_char> = ext_names.iter().map(|s| s.as_ptr()).collect();
+
+    let app_info = vk::ApplicationInfo::default()
+        .application_name(c"calibrationclient")
+        .api_version(vk::API_VERSION_1_1);
+    let instance = unsafe {
+        entry
+            .create_instance(
+                &vk::InstanceCreateInfo::default().application_info(&app_info).enabled_extension_names(&ext_ptrs),
+                None,
+            )
+            .map_err(vk_err)?
+    };
+
+    let surface_loader = khr::surface::Instance::new(&entry, &instance);
+    let surface = match window.vulkan_create_surface(instance.handle().as_raw() as usize) {
+        Ok(raw) => vk::SurfaceKHR::from_raw(raw),
+        Err(e) => {
+            unsafe { instance.destroy_instance(None) };
+            return Err(format!("cannot create a Vulkan surface: {e}"));
+        }
+    };
+
+    let queried = (|| -> Result<(bool, bool), String> {
+        let (mut hdr10, mut hlg) = (false, false);
+        for pd in unsafe { instance.enumerate_physical_devices() }.map_err(vk_err)? {
+            let dev_exts = unsafe { instance.enumerate_device_extension_properties(pd) }.map_err(vk_err)?;
+            let has_swapchain = dev_exts
+                .iter()
+                .any(|e| e.extension_name_as_c_str().map(|n| n == khr::swapchain::NAME).unwrap_or(false));
+            let can_present = unsafe { instance.get_physical_device_queue_family_properties(pd) }
+                .iter()
+                .enumerate()
+                .any(|(i, q)| {
+                    q.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                        && unsafe {
+                            surface_loader.get_physical_device_surface_support(pd, i as u32, surface).unwrap_or(false)
+                        }
+                });
+            if !has_swapchain || !can_present {
+                continue;
+            }
+            let formats =
+                unsafe { surface_loader.get_physical_device_surface_formats(pd, surface) }.map_err(vk_err)?;
+            let (a, b) = classify_formats(&formats);
+            hdr10 |= a;
+            hlg |= b;
+        }
+        Ok((hdr10, hlg))
+    })();
+
+    // Release everything Vulkan before the window and SDL go away.
+    unsafe {
+        surface_loader.destroy_surface(surface, None);
+        instance.destroy_instance(None);
+    }
+
+    let (hdr10, hlg) = queried?;
+    support.hdr10 = hdr10;
+    support.hlg = hlg;
+    Ok(support)
+}
+
 // -------------------------------------------------------------------------------------
 // Vulkan presenter
 // -------------------------------------------------------------------------------------
@@ -176,6 +480,9 @@ pub struct HdrPresenter {
     // swapchain-dependent state
     swapchain: vk::SwapchainKHR,
     extent: vk::Extent2D,
+    /// Drawable size the current swapchain was requested for (see `rebuild_needed`).
+    requested: (u32, u32),
+    last_rebuild: Instant,
     image_views: Vec<vk::ImageView>,
     framebuffers: Vec<vk::Framebuffer>,
     render_finished: Vec<vk::Semaphore>,
@@ -434,6 +741,8 @@ impl HdrPresenter {
             in_flight,
             swapchain: vk::SwapchainKHR::null(),
             extent: vk::Extent2D { width: 0, height: 0 },
+            requested: (0, 0),
+            last_rebuild: Instant::now(),
             image_views: Vec::new(),
             framebuffers: Vec::new(),
             render_finished: Vec::new(),
@@ -447,9 +756,76 @@ impl HdrPresenter {
         &mut self.window
     }
 
-    /// Drawable size in physical pixels (what the swapchain is sized to).
-    pub fn output_size(&self) -> (u32, u32) {
+    /// Drawable size in physical pixels, as SDL reports it.
+    fn drawable_size(&self) -> (u32, u32) {
         self.window.vulkan_drawable_size()
+    }
+
+    /// Make sure the swapchain matches the window and return the real framebuffer size.
+    /// Call once per frame before laying out patches. (While minimised there is no
+    /// framebuffer, and the drawable size is returned instead.)
+    pub fn sync_size(&mut self) -> Result<(u32, u32), HdrError> {
+        self.rebuild_if_needed()?;
+        if self.swapchain == vk::SwapchainKHR::null() {
+            Ok(self.drawable_size())
+        } else {
+            Ok((self.extent.width, self.extent.height))
+        }
+    }
+
+    fn rebuild_if_needed(&mut self) -> Result<(), HdrError> {
+        let needed = rebuild_needed(
+            self.drawable_size(),
+            self.requested,
+            self.swapchain != vk::SwapchainKHR::null(),
+            self.last_rebuild.elapsed(),
+        );
+        if !needed {
+            return Ok(());
+        }
+        match self.recreate_swapchain() {
+            Err(HdrError::Vk(vk::Result::ERROR_SURFACE_LOST_KHR)) => self.recreate_surface(),
+            other => other,
+        }
+    }
+
+    /// The compositor can invalidate the whole `VkSurfaceKHR` (not just the swapchain).
+    /// Build a new one from the SDL window and carry on, provided it still offers the HDR
+    /// format we are running with.
+    fn recreate_surface(&mut self) -> Result<(), HdrError> {
+        eprintln!("HDR: Vulkan surface lost, recreating it");
+        unsafe { self.device.device_wait_idle()? };
+        self.destroy_swapchain_resources();
+        unsafe {
+            if self.swapchain != vk::SwapchainKHR::null() {
+                self.swapchain_loader.destroy_swapchain(self.swapchain, None);
+                self.swapchain = vk::SwapchainKHR::null();
+            }
+            self.surface_loader.destroy_surface(self.surface, None);
+        }
+        // Null in the meantime so `Drop` never destroys the old handle a second time.
+        self.surface = vk::SurfaceKHR::null();
+
+        let raw_surface = self
+            .window
+            .vulkan_create_surface(self.instance.handle().as_raw() as usize)
+            .map_err(|e| HdrError::Other(format!("SDL could not recreate the Vulkan surface: {e}")))?;
+        self.surface = vk::SurfaceKHR::from_raw(raw_surface);
+
+        let formats = unsafe {
+            self.surface_loader
+                .get_physical_device_surface_formats(self.physical_device, self.surface)?
+        };
+        let still_offered = formats.iter().any(|f| {
+            f.format == self.surface_format.format && f.color_space == self.surface_format.color_space
+        });
+        if !still_offered {
+            return other(
+                "The new window surface no longer offers the HDR format. \
+                 Was HDR switched off in the compositor? Restart the client.",
+            );
+        }
+        self.recreate_swapchain()
     }
 
     fn destroy_swapchain_resources(&mut self) {
@@ -474,7 +850,9 @@ impl HdrPresenter {
             self.surface_loader
                 .get_physical_device_surface_capabilities(self.physical_device, self.surface)?
         };
-        let (dw, dh) = self.output_size();
+        let (dw, dh) = self.drawable_size();
+        self.requested = (dw, dh);
+        self.last_rebuild = Instant::now();
         let extent = if caps.current_extent.width != u32::MAX {
             caps.current_extent
         } else {
@@ -582,15 +960,19 @@ impl HdrPresenter {
     /// Draw one frame: fill everything with `background`, then each rectangle on top.
     /// All colours are encoded signal levels (0.0..=1.0) and are written as-is.
     pub fn draw(&mut self, background: [f32; 3], rects: &[FillRect]) -> Result<(), HdrError> {
+        match self.draw_frame(background, rects) {
+            // A lost surface is recoverable; everything else (device lost, out of memory...)
+            // is reported to the caller.
+            Err(HdrError::Vk(vk::Result::ERROR_SURFACE_LOST_KHR)) => self.recreate_surface(),
+            other => other,
+        }
+    }
+
+    fn draw_frame(&mut self, background: [f32; 3], rects: &[FillRect]) -> Result<(), HdrError> {
         // Resize / recreate if the window size changed or we have no swapchain yet.
-        let (dw, dh) = self.output_size();
-        if self.swapchain == vk::SwapchainKHR::null()
-            || (dw, dh) != (self.extent.width, self.extent.height)
-        {
-            self.recreate_swapchain()?;
-            if self.swapchain == vk::SwapchainKHR::null() {
-                return Ok(()); // minimised
-            }
+        self.rebuild_if_needed()?;
+        if self.swapchain == vk::SwapchainKHR::null() {
+            return Ok(()); // minimised
         }
 
         unsafe { self.device.wait_for_fences(&[self.in_flight], true, u64::MAX)? };
@@ -686,7 +1068,15 @@ impl HdrPresenter {
                     .image_indices(&indices),
             ) {
                 Ok(false) => {}
-                Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.recreate_swapchain()?,
+                // "Suboptimal" can persist for as long as the window exists on some
+                // compositors; rebuilding on every frame would be far worse than a slightly
+                // suboptimal swapchain, so it is rebuilt at most once per second.
+                Ok(true) => {
+                    if self.last_rebuild.elapsed() >= Duration::from_secs(1) {
+                        self.recreate_swapchain()?;
+                    }
+                }
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.recreate_swapchain()?,
                 Err(e) => return Err(e.into()),
             }
         }
@@ -735,6 +1125,90 @@ mod tests {
     fn out_of_range_values_are_clamped() {
         let c = ColorRGB::from_components_u16(2000, 0, 0, 10);
         assert_eq!(color_to_unit_rgb(c)[0], 1.0);
+    }
+
+    #[test]
+    fn hdr_formats_are_recognised_per_colour_space() {
+        let f = |format, color_space| vk::SurfaceFormatKHR { format, color_space };
+        let sdr = f(vk::Format::B8G8R8A8_UNORM, vk::ColorSpaceKHR::SRGB_NONLINEAR);
+        let pq = f(vk::Format::A2B10G10R10_UNORM_PACK32, vk::ColorSpaceKHR::HDR10_ST2084_EXT);
+        let hlg = f(vk::Format::A2R10G10B10_UNORM_PACK32, vk::ColorSpaceKHR::HDR10_HLG_EXT);
+        let wrong_depth = f(vk::Format::B8G8R8A8_UNORM, vk::ColorSpaceKHR::HDR10_ST2084_EXT);
+
+        assert_eq!(classify_formats(&[]), (false, false));
+        assert_eq!(classify_formats(&[sdr, wrong_depth]), (false, false));
+        assert_eq!(classify_formats(&[sdr, pq]), (true, false));
+        assert_eq!(classify_formats(&[hlg]), (false, true));
+        assert_eq!(classify_formats(&[pq, hlg]), (true, true));
+        assert!(HdrSupport { hlg: true, ..Default::default() }.any());
+        assert!(!HdrSupport::default().any());
+    }
+
+    #[test]
+    fn kde_hdr_state_is_read_from_kscreen_doctor_output() {
+        let off = "Output: 1 DP-1 enabled connected\n\tGeometry: 0,0 3840x2160\n\tHDR: disabled\n\tWide Color Gamut: disabled\n";
+        let on = "Output: 1 DP-1 enabled connected\n\tHDR: enabled\n\tSDR brightness: 300\n";
+        assert_eq!(parse_kde_hdr_state(off), Some(false));
+        assert_eq!(parse_kde_hdr_state(on), Some(true));
+        // one HDR display among several is enough
+        assert_eq!(parse_kde_hdr_state(&format!("{off}{on}")), Some(true));
+        // coloured output, and everything on one line
+        assert_eq!(parse_kde_hdr_state("Output: 1 HDR: \u{1b}[01;31mdisabled\u{1b}[0;0m Vrr: Automatic"), Some(false));
+        // JSON form
+        assert_eq!(parse_kde_hdr_state("{\"outputs\":[{\"hdr\": false,\"name\":\"DP-1\"}]}"), Some(false));
+        assert_eq!(parse_kde_hdr_state("{\"outputs\":[{\"hdr\":true}]}"), Some(true));
+        // nothing usable -> unknown, never "off"
+        assert_eq!(parse_kde_hdr_state("Output: 1 HDR: incapable"), None);
+        assert_eq!(parse_kde_hdr_state("kscreen-doctor: command not found"), None);
+        assert_eq!(parse_kde_hdr_state(""), None);
+    }
+
+    #[test]
+    fn only_kde_sessions_are_asked() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let run = |_: &[&str]| {
+            calls.set(calls.get() + 1);
+            Some("HDR: disabled".to_string())
+        };
+        assert_eq!(kde_hdr_state_with("GNOME", &run), None);
+        assert_eq!(calls.get(), 0, "other desktops are not queried");
+        assert_eq!(kde_hdr_state_with("KDE", &run), Some(false));
+        assert_eq!(kde_hdr_state_with("KDE:Plasma", &run), Some(false));
+
+        // -o says nothing usable, -j does
+        let json_only = |args: &[&str]| Some(if args == ["-j"] { "\"hdr\": true" } else { "nothing" }.to_string());
+        assert_eq!(kde_hdr_state_with("KDE", json_only), Some(true));
+        // tool missing
+        assert_eq!(kde_hdr_state_with("KDE", |_: &[&str]| None), None);
+    }
+
+    /// Needs a stand-in `kscreen-doctor` first on PATH (run with `--ignored`); it must print
+    /// its report to *stderr*, like the real tool does through Qt logging.
+    #[test]
+    #[ignore]
+    fn kscreen_doctor_report_is_captured_from_stderr() {
+        let text = run_kscreen_doctor(&["-o"]).expect("kscreen-doctor should run");
+        assert_eq!(parse_kde_hdr_state(&text), Some(false), "captured: {text:?}");
+    }
+
+    #[test]
+    fn kde_reporting_hdr_off_disables_hdr_even_if_vulkan_offers_it() {
+        let offered = HdrSupport { hdr10: true, hlg: true, ..Default::default() };
+        assert!(offered.any());
+        assert!(!HdrSupport { kde_hdr_off: true, ..offered }.any());
+    }
+
+    #[test]
+    fn swapchain_rebuild_decisions() {
+        let ms = Duration::from_millis;
+        // steady state: nothing to do, whatever the surface's own extent says
+        assert!(!rebuild_needed((1280, 720), (1280, 720), true, ms(5000)));
+        // resized
+        assert!(rebuild_needed((1920, 1080), (1280, 720), true, ms(0)));
+        // minimised: retry, but not on every frame
+        assert!(!rebuild_needed((1280, 720), (1280, 720), false, ms(10)));
+        assert!(rebuild_needed((1280, 720), (1280, 720), false, ms(100)));
     }
 
     #[test]

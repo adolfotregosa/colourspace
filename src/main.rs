@@ -1,13 +1,10 @@
 use argh::FromArgs;
 use tinyfiledialogs as tfd;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
 use std::time::{Duration, Instant};
-use std::thread::{sleep, spawn};
+use std::thread::sleep;
 use std::error::Error;
 
+mod config;
 mod hdr;
 mod lan;
 mod startup;
@@ -26,28 +23,71 @@ struct Args {
     remote: Option<String>,
 
     /// output signal: sdr (default), hdr10 (BT.2020 PQ) or hlg
-    #[argh(option, default = "HdrMode::Sdr")]
-    hdr: HdrMode,
+    #[argh(option)]
+    hdr: Option<HdrMode>,
 
     /// mastering display primaries in the HDR metadata: bt2020 (default) or p3d65
-    #[argh(option, default = "Primaries::Bt2020")]
-    primaries: Primaries,
+    #[argh(option)]
+    primaries: Option<Primaries>,
 
     /// mastering display peak luminance in cd/m2 for the HDR metadata (default 1000)
-    #[argh(option, default = "1000.0")]
-    max_luminance: f32,
+    #[argh(option)]
+    max_luminance: Option<f32>,
 
     /// mastering display black level in cd/m2 for the HDR metadata (default 0.0001)
-    #[argh(option, default = "0.0001")]
-    min_luminance: f32,
+    #[argh(option)]
+    min_luminance: Option<f32>,
 
     /// maximum content light level (MaxCLL) in cd/m2 for the HDR metadata (default 0 = unspecified)
-    #[argh(option, default = "0.0")]
-    max_cll: f32,
+    #[argh(option)]
+    max_cll: Option<f32>,
 
     /// maximum frame average light level (MaxFALL) in cd/m2 for the HDR metadata (default 0 = unspecified)
-    #[argh(option, default = "0.0")]
-    max_fall: f32,
+    #[argh(option)]
+    max_fall: Option<f32>,
+}
+
+impl Args {
+    /// Put the options that were actually given on top of `settings`.
+    fn apply_to(&self, settings: &mut startup::Settings) {
+        if let Some(remote) = &self.remote {
+            settings.remote = remote.clone();
+        }
+        if let Some(mode) = self.hdr {
+            settings.hdr = mode;
+            if mode != HdrMode::Sdr {
+                settings.signal = mode;
+            }
+        }
+        if let Some(v) = self.primaries {
+            settings.primaries = v;
+        }
+        if let Some(v) = self.max_luminance {
+            settings.max_luminance = v;
+        }
+        if let Some(v) = self.min_luminance {
+            settings.min_luminance = v;
+        }
+        if let Some(v) = self.max_cll {
+            settings.max_cll = v;
+        }
+        if let Some(v) = self.max_fall {
+            settings.max_fall = v;
+        }
+    }
+}
+
+/// Starting values, lowest priority first: the built-in defaults, then what was remembered,
+/// then the options given on the command line. Remembered values only apply when the startup
+/// window is going to be shown (no address on the command line): a run that names its address
+/// does exactly what its command line says, and in particular never turns HDR on by itself.
+fn initial_settings(args: &Args, saved: &config::Saved) -> startup::Settings {
+    let mut settings = startup::Settings::built_in();
+    if args.remote.is_none() {
+        settings.apply_saved(saved);
+    }
+    args.apply_to(&mut settings);
+    settings
 }
 
 /// Where patches end up: the original 8-bit SDL renderer, or the Vulkan HDR presenter.
@@ -64,51 +104,109 @@ impl Output {
         }
     }
 
-    fn size(&self) -> Result<(u32, u32), String> {
+    /// Current drawable size in pixels. For HDR this also rebuilds the swapchain after a
+    /// resize, so the returned size is always the real framebuffer size.
+    fn size(&mut self) -> Result<(u32, u32), Box<dyn Error>> {
         match self {
-            Output::Sdr(canvas) => canvas.output_size(),
-            Output::Hdr(hdr) => Ok(hdr.output_size()),
+            Output::Sdr(canvas) => Ok(canvas.output_size()?),
+            Output::Hdr(hdr) => Ok(hdr.sync_size()?),
         }
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    // Parse arguments first: HDR needs to pick the SDL video driver before SDL starts.
-    let mut args: Args = argh::from_env();
+/// Append the default ColourSpace port (20002) when the address has none.
+/// Handles host names, IPv4, bracketed IPv6 (`[::1]`, `[::1]:20002`) and bare IPv6 (`::1`).
+fn add_default_port(s: &str) -> String {
+    const DEFAULT_PORT: u16 = 20002;
+    let s = s.trim();
 
-    // No IP on the command line: show the startup window (IP + HDR checkbox and menus),
-    // pre-filled from any options that were given. This runs before SDL is started for
-    // the main window because the HDR choice decides which video driver SDL must use.
-    if args.remote.is_none() {
-        let defaults = startup::Settings {
-            remote: String::new(),
-            hdr: args.hdr,
-            primaries: args.primaries,
-            max_luminance: args.max_luminance,
-            min_luminance: args.min_luminance,
-            max_cll: args.max_cll,
-            max_fall: args.max_fall,
+    if let Some(rest) = s.strip_prefix('[') {
+        return match rest.split_once(']') {
+            Some((_, "")) => format!("{s}:{DEFAULT_PORT}"),
+            // "[addr]:port" (or anything else malformed) is passed on; the resolver reports it.
+            _ => s.to_string(),
         };
-        match startup::show(defaults)? {
-            Some(chosen) => {
-                args.remote = Some(chosen.remote);
-                args.hdr = chosen.hdr;
-                args.primaries = chosen.primaries;
-                args.max_luminance = chosen.max_luminance;
-                args.min_luminance = chosen.min_luminance;
-                args.max_cll = chosen.max_cll;
-                args.max_fall = chosen.max_fall;
-            }
-            None => return Ok(()),
-        }
     }
 
+    match s.matches(':').count() {
+        0 => format!("{s}:{DEFAULT_PORT}"),
+        1 => {
+            let (host, port) = s.split_once(':').unwrap();
+            if port.parse::<u16>().is_ok() {
+                s.to_string()
+            } else if port.is_empty() {
+                format!("{host}:{DEFAULT_PORT}") // "host:" with the port left off
+            } else {
+                format!("{s}:{DEFAULT_PORT}")
+            }
+        }
+        _ => format!("[{s}]:{DEFAULT_PORT}"), // bare IPv6 address
+    }
+}
+
+/// Window title: shows the HDR mode and whether the link to ColourSpace is up.
+fn window_title(mode: HdrMode, disconnected: bool) -> String {
+    let mut title = String::from("Calibration Client Linux");
+    if mode != HdrMode::Sdr {
+        title.push_str(&format!(" [{}]", mode.label()));
+    }
+    if disconnected {
+        title.push_str(" - connection lost, reconnecting...");
+    }
+    title
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args: Args = argh::from_env();
+
+    // Everything the startup window edits: pre-filled with what was used last time, unless
+    // the command line says otherwise.
+    let saved = config::load();
+    let mut settings = initial_settings(&args, &saved);
+
+    // Connect to ColourSpace *before* SDL and the main window exist. That way a failed
+    // connection can simply bring the startup window back (with the same values) and the HDR
+    // choice can still decide the SDL video driver, which must be set before SDL starts.
+    let mut use_cli_address = args.remote.is_some();
+    // Whether HDR can be used here is only checked when the startup window is actually shown.
+    let mut hdr_support: Option<hdr::HdrSupport> = None;
+    let worker = loop {
+        if !use_cli_address {
+            let support = hdr_support.get_or_insert_with(hdr::probe);
+            match startup::show(settings.clone(), support)? {
+                Some(chosen) => settings = chosen,
+                None => return Ok(()),
+            }
+        }
+        use_cli_address = false;
+
+        let remote_addr = add_default_port(&settings.remote);
+        match spawn_worker(&remote_addr, false) {
+            Ok(state) => {
+                eprintln!("Connected to {}; waiting for ColourSpace to send patches", remote_addr);
+                // Only what worked is remembered. The HDR choices are only updated when the
+                // startup window was shown and HDR could really be chosen there; a temporary
+                // "HDR unavailable" must not wipe the preference.
+                let hdr_usable = hdr_support.as_ref().is_some_and(|s| s.any());
+                config::save(&settings.to_saved(hdr_usable, &saved));
+                break state;
+            }
+            Err(err) => {
+                eprintln!("Failed to connect to {}: {}", remote_addr, err);
+                let text = format!(
+                    "ColourSpace not reachable at {}\n\n{}\n\nCheck the IP address and that ColourSpace is running.",
+                    remote_addr, err
+                );
+                let _ = tfd::message_box_ok("Calibration Client Linux", &text, tfd::MessageBoxIcon::Error);
+                // loop round: the startup window comes back so nothing has to be retyped
+            }
+        }
+    };
+    let hdr_mode = settings.hdr;
+
     // HDR only works through the native Wayland driver (XWayland has no HDR).
-    if args.hdr != HdrMode::Sdr
-        && std::env::var_os("SDL_VIDEODRIVER").is_none()
-        && std::env::var_os("WAYLAND_DISPLAY").is_some()
-    {
-        sdl2::hint::set("SDL_VIDEODRIVER", "wayland");
+    if hdr_mode != HdrMode::Sdr {
+        hdr::prefer_wayland_driver();
     }
 
     let sdl_context = sdl2::init()?;
@@ -118,52 +216,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     const DEFAULT_H: u32 = 720;
 
     // Always start windowed; fullscreen only via double-click
-    let window_title = match args.hdr {
-        HdrMode::Sdr => "Calibration Client Linux".to_string(),
-        mode => format!("Calibration Client Linux [{}]", mode.label()),
-    };
+    let initial_title = window_title(hdr_mode, false);
     let window = video
-    .window(&window_title, DEFAULT_W, DEFAULT_H)
+    .window(&initial_title, DEFAULT_W, DEFAULT_H)
     .position_centered()
     .vulkan()
     .resizable()
     .allow_highdpi()
     .build()?;
-
-    fn pad(msg: &str, width: usize) -> String {
-        let mut s = msg.to_string();
-        if s.len() < width {
-            s.reserve(width - s.len());
-            while s.len() < width {
-                s.push(' ');
-            }
-        }
-        s
-    }
-
-    fn show_startup_ui() -> Option<String> {
-        // Make this large enough to avoid title truncation on your desktop.
-        // Try 80..120 if your title is still clipped.
-        const PAD_WIDTH: usize = 80;
-
-        let title = "Calibration Client Linux";
-        let server = tfd::input_box(title, &pad("ColourSpace IP:", PAD_WIDTH), "")?;
-
-        if server.trim().is_empty() {
-            None
-        } else {
-            Some(server)
-        }
-    }
-
-    fn add_default_port(s: &str) -> String {
-        if let Some(pos) = s.rfind(':') {
-            if s[pos + 1..].parse::<u16>().is_ok() {
-                return s.to_string();
-            }
-        }
-        format!("{}:20002", s)
-    }
 
     fn select_measure_colour(shapes: &[ShapeInstruction]) -> Option<ColorRGB> {
         shapes
@@ -247,153 +307,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Create event pump early so we can keep the window responsive during waits
-    // ---------------------------------------------------------------------
     let mut event_pump = sdl_context.event_pump()?;
-
-    // ---------------------------------------------------------------------
-    // STARTUP UI + NETWORK WORKER SETUP (retry on failure) - with connect timeout
-    // and non-freezing dialog handling
-    // ---------------------------------------------------------------------
     let mut current_measure_colour = ColorRGB::default();
-    let mut maybe_remote = args.remote;
-
-    // Increased timeout to 6000ms to give slower setups time to connect.
-    const CONNECT_TIMEOUT_MS: u64 = 6000;
-    const CONNECT_POLL_MS: u64 = 50;
-
-    // The loop yields Some(worker_state) when we have a worker that successfully connected.
-    // If the user cancels the UI, we exit cleanly.
-    let worker = loop {
-        // Use CLI-provided address once; otherwise prompt the UI.
-        let remote_input = maybe_remote.take().or_else(|| show_startup_ui());
-
-        // If the user cancelled the UI (or provided empty input), exit gracefully.
-        let remote = match remote_input {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-
-        let remote_addr = add_default_port(&remote);
-
-        match spawn_worker(&remote_addr, false) {
-            Ok(state) => {
-                // Tell worker what colour to request initially.
-                state.write().unwrap().request_colour = current_measure_colour;
-
-                // Wait a short while for the worker thread to actually establish a connection,
-                // but keep the SDL window responsive while we wait.
-                let mut elapsed = 0u64;
-                let mut connected = {
-                    let r = state.read().unwrap();
-                    r.connected
-                };
-
-                // debug print initial state
-                eprintln!("Waiting up to {}ms for ColourSpace to connect (initial connected={})", CONNECT_TIMEOUT_MS, connected);
-
-                while !connected && elapsed < CONNECT_TIMEOUT_MS {
-                    // Poll SDL events so the window remains responsive
-                    for evt in event_pump.poll_iter() {
-                        match evt {
-                            sdl2::event::Event::Quit { .. } => return Ok(()),
-                            _ => {}
-                        }
-                    }
-
-                    std::thread::sleep(std::time::Duration::from_millis(CONNECT_POLL_MS));
-                    elapsed += CONNECT_POLL_MS;
-
-                    connected = {
-                        let r = state.read().unwrap();
-                        r.connected
-                    };
-
-                    // small debug print every 1s
-                    if elapsed % 1000 == 0 {
-                        eprintln!("  connect wait: {}ms elapsed, connected={}", elapsed, connected);
-                    }
-                }
-
-                if connected {
-                    // success: worker connected within timeout — keep it.
-                    eprintln!("ColourSpace connected after {}ms", elapsed);
-                    break Some(state);
-                } else {
-                    // Timed out: worker never connected. Drop it and show error dialog without freezing the UI.
-                    eprintln!(
-                        "spawn_worker returned Ok but failed to connect within {}ms (last connected={})",
-                              CONNECT_TIMEOUT_MS, connected
-                    );
-
-                    // We'll spawn a thread to show the blocking message box, and use an AtomicBool
-                    // to detect when the user has dismissed it — while still polling SDL events.
-                    let dialog_done = Arc::new(AtomicBool::new(false));
-                    let dialog_done_clone = Arc::clone(&dialog_done);
-
-                    // Spawn the dialog on another thread (it will block there until user presses OK).
-                    let _dialog_thread = spawn(move || {
-                        let _ = tfd::message_box_ok(
-                            "Calibration Client Linux",
-                            "ColourSpace not reachable, check IP address",
-                            tfd::MessageBoxIcon::Error,
-                        );
-                        dialog_done_clone.store(true, Ordering::SeqCst);
-                    });
-
-                    // Wait for the dialog to be dismissed while continuing to poll SDL events.
-                    while !dialog_done.load(Ordering::SeqCst) {
-                        for evt in event_pump.poll_iter() {
-                            match evt {
-                                sdl2::event::Event::Quit { .. } => return Ok(()),
-                                _ => {}
-                            }
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-
-                    // Loop will continue and re-open show_startup_ui().
-                }
-            }
-            Err(err) => {
-                eprintln!("Failed to spawn worker: {}", err);
-
-                // Show the error message non-freezing (same pattern as above)
-                let dialog_done = Arc::new(AtomicBool::new(false));
-                let dialog_done_clone = Arc::clone(&dialog_done);
-
-                let err_str = format!("ColourSpace not found\n\n{}", err);
-                let _dialog_thread = spawn(move || {
-                    let _ = tfd::message_box_ok("Calibration Client Linux", &err_str, tfd::MessageBoxIcon::Error);
-                    dialog_done_clone.store(true, Ordering::SeqCst);
-                });
-
-                while !dialog_done.load(Ordering::SeqCst) {
-                    for evt in event_pump.poll_iter() {
-                        match evt {
-                            sdl2::event::Event::Quit { .. } => return Ok(()),
-                            _ => {}
-                        }
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-
-                // loop will continue and re-open show_startup_ui()
-            }
-        }
-    };
 
     // Build the output once we have a worker (or the user cancelled earlier).
-    let mut output = match args.hdr {
+    let mut output = match hdr_mode {
         HdrMode::Sdr => Output::Sdr(window.into_canvas().build()?),
         mode => {
             let metadata = HdrMetadata {
-                primaries: args.primaries,
-                max_luminance: args.max_luminance,
-                min_luminance: args.min_luminance,
-                max_cll: args.max_cll,
-                max_fall: args.max_fall,
+                primaries: settings.primaries,
+                max_luminance: settings.max_luminance,
+                min_luminance: settings.min_luminance,
+                max_cll: settings.max_cll,
+                max_fall: settings.max_fall,
             };
             match HdrPresenter::new(window, mode, metadata) {
                 Ok(presenter) => Output::Hdr(presenter),
@@ -407,7 +333,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     };
-    // Note: we already created event_pump earlier; reuse it.
+    let mut title_shows_disconnected = false;
+
+    // The mouse pointer is hidden while the window is fullscreen (it would sit on top of the
+    // patch and light it) and comes back in windowed mode.
+    let mouse = sdl_context.mouse();
+    let mut pointer_hidden = false;
+    let mut seen_fullscreen = false;
 
     // double-click detection
     let mut last_click_time = None::<Instant>;
@@ -504,27 +436,35 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // One read of the worker state per frame (if any)
-        let (disconnected, shapes, worker_current_colour) = if let Some(state) = worker.as_ref() {
-            let r = state.read().unwrap();
+        // Follow the window's *actual* fullscreen state (it can also be changed by the desktop,
+        // not just by our double-click): hide the pointer in fullscreen, show it otherwise.
+        let fullscreen_now = output.window_mut().fullscreen_state() != sdl2::video::FullscreenType::Off;
+        if fullscreen_now != pointer_hidden {
+            mouse.show_cursor(!fullscreen_now);
+            pointer_hidden = fullscreen_now;
+        }
+        if !fullscreen_now && seen_fullscreen {
+            is_fullscreen = false; // the desktop took us out of fullscreen; keep the toggle in step
+        }
+        seen_fullscreen = fullscreen_now;
+
+        // One read of the worker state per frame
+        let (disconnected, shapes, worker_current_colour) = {
+            let r = lan::read_state(&worker);
             (!r.connected, r.shapes.clone(), r.current_measure_colour)
-        } else {
-            (true, Vec::new(), ColorRGB::default())
         };
 
+        // Show in the title bar when the link to ColourSpace drops (the worker reconnects itself)
+        if disconnected != title_shows_disconnected {
+            title_shows_disconnected = disconnected;
+            output.window_mut().set_title(&window_title(hdr_mode, disconnected)).ok();
+        }
+
         // Update current measure colour depending on worker state and shapes
-        if disconnected {
-            if worker.is_none() {
-                // keep whatever current_measure_colour already is
-            } else {
-                current_measure_colour = worker_current_colour;
-            }
+        if disconnected || shapes.is_empty() {
+            current_measure_colour = worker_current_colour;
         } else {
-            if shapes.is_empty() {
-                current_measure_colour = worker_current_colour;
-            } else {
-                current_measure_colour = select_measure_colour(&shapes).unwrap_or(current_measure_colour);
-            }
+            current_measure_colour = select_measure_colour(&shapes).unwrap_or(current_measure_colour);
         }
 
         // Draw
@@ -561,4 +501,97 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_args() -> Args {
+        Args {
+            remote: None,
+            hdr: None,
+            primaries: None,
+            max_luminance: None,
+            min_luminance: None,
+            max_cll: None,
+            max_fall: None,
+        }
+    }
+
+    fn remembered() -> config::Saved {
+        config::Saved {
+            ip: Some("192.168.1.5".into()),
+            hdr_enabled: Some(true),
+            signal: Some("hlg".into()),
+            primaries: Some("p3d65".into()),
+            max_luminance: Some(1200.0),
+            min_luminance: Some(0.0005),
+            max_cll: Some(1000.0),
+            max_fall: Some(400.0),
+        }
+    }
+
+    #[test]
+    fn the_startup_window_starts_from_what_was_remembered() {
+        let s = initial_settings(&no_args(), &remembered());
+        assert_eq!(s.remote, "192.168.1.5");
+        assert_eq!((s.hdr, s.signal, s.primaries), (HdrMode::Hlg, HdrMode::Hlg, Primaries::P3D65));
+        assert_eq!((s.max_luminance, s.min_luminance, s.max_cll, s.max_fall), (1200.0, 0.0005, 1000.0, 400.0));
+
+        // nothing remembered: the built-in defaults
+        let s = initial_settings(&no_args(), &config::Saved::default());
+        assert_eq!((s.remote.as_str(), s.hdr, s.signal, s.max_luminance), ("", HdrMode::Sdr, HdrMode::Hdr10, 1000.0));
+    }
+
+    #[test]
+    fn explicit_options_beat_remembered_values() {
+        let args = Args { hdr: Some(HdrMode::Hdr10), max_luminance: Some(500.0), ..no_args() };
+        let s = initial_settings(&args, &remembered());
+        assert_eq!((s.hdr, s.signal), (HdrMode::Hdr10, HdrMode::Hdr10));
+        assert_eq!(s.max_luminance, 500.0);
+        assert_eq!(s.primaries, Primaries::P3D65, "options that were not given still come from memory");
+
+        // --hdr sdr unticks the box but keeps the remembered signal for the menu
+        let args = Args { hdr: Some(HdrMode::Sdr), ..no_args() };
+        let s = initial_settings(&args, &remembered());
+        assert_eq!((s.hdr, s.signal), (HdrMode::Sdr, HdrMode::Hlg));
+    }
+
+    #[test]
+    fn a_run_with_an_address_ignores_remembered_hdr_choices() {
+        let args = Args { remote: Some("10.0.0.7".into()), ..no_args() };
+        let s = initial_settings(&args, &remembered());
+        assert_eq!(s.remote, "10.0.0.7");
+        assert_eq!(s.hdr, HdrMode::Sdr, "HDR is never switched on behind the command line's back");
+        assert_eq!((s.max_luminance, s.primaries), (1000.0, Primaries::Bt2020));
+
+        let args = Args { remote: Some("10.0.0.7".into()), hdr: Some(HdrMode::Hlg), ..no_args() };
+        assert_eq!(initial_settings(&args, &remembered()).hdr, HdrMode::Hlg);
+    }
+
+    #[test]
+    fn default_port_is_added_only_when_missing() {
+        assert_eq!(add_default_port("192.168.1.5"), "192.168.1.5:20002");
+        assert_eq!(add_default_port("192.168.1.5:1234"), "192.168.1.5:1234");
+        assert_eq!(add_default_port("colourspace-pc"), "colourspace-pc:20002");
+        assert_eq!(add_default_port("colourspace-pc:1234"), "colourspace-pc:1234");
+        assert_eq!(add_default_port("host:"), "host:20002");
+        assert_eq!(add_default_port("  10.0.0.2  "), "10.0.0.2:20002");
+    }
+
+    #[test]
+    fn ipv6_addresses_are_not_mistaken_for_host_port() {
+        assert_eq!(add_default_port("::1"), "[::1]:20002");
+        assert_eq!(add_default_port("fe80::1"), "[fe80::1]:20002");
+        assert_eq!(add_default_port("[::1]"), "[::1]:20002");
+        assert_eq!(add_default_port("[::1]:5000"), "[::1]:5000");
+    }
+
+    #[test]
+    fn title_reflects_mode_and_connection() {
+        assert_eq!(window_title(HdrMode::Sdr, false), "Calibration Client Linux");
+        assert_eq!(window_title(HdrMode::Hdr10, false), "Calibration Client Linux [HDR10]");
+        assert!(window_title(HdrMode::Hlg, true).contains("reconnecting"));
+    }
 }
