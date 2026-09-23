@@ -194,6 +194,15 @@ const NOTE_WARN: Color = Color::RGB(226, 168, 70);
 /// Message line(s) shown under the HDR checkbox: (colour, lines at 8px per character).
 /// Each line must fit the window (checked by a test): at most 66 characters.
 fn support_note(support: &HdrSupport) -> (Color, Vec<String>) {
+    if (support.hdr10 || support.hlg) && support.kde_no_hdr_display {
+        return (
+            NOTE_WARN,
+            vec![
+                "HDR unavailable: KDE reports no HDR-capable display.".to_string(),
+                "It needs an HDR monitor on an HDR-capable port and cable.".to_string(),
+            ],
+        );
+    }
     if (support.hdr10 || support.hlg) && support.kde_hdr_off {
         return (
             NOTE_WARN,
@@ -1072,11 +1081,11 @@ mod tests {
     }
 
     fn full() -> HdrSupport {
-        HdrSupport { hdr10: true, hlg: true, sdr10: true, driver: "wayland".into(), problem: None, kde_hdr_off: false }
+        HdrSupport { hdr10: true, hlg: true, sdr10: true, driver: "wayland".into(), problem: None, kde_hdr_off: false, kde_no_hdr_display: false }
     }
 
     fn none() -> HdrSupport {
-        HdrSupport { hdr10: false, hlg: false, sdr10: false, driver: "wayland".into(), problem: None, kde_hdr_off: false }
+        HdrSupport { hdr10: false, hlg: false, sdr10: false, driver: "wayland".into(), problem: None, kde_hdr_off: false, kde_no_hdr_display: false }
     }
 
     fn click(form: &mut Form, r: Rect) -> Action {
@@ -1224,7 +1233,12 @@ mod tests {
     fn remembered_hdr_is_still_disabled_when_hdr_is_no_longer_available() {
         let mut d = defaults();
         d.apply_saved(&remembered());
-        for support in [none(), HdrSupport { driver: "x11".into(), ..none() }, HdrSupport { kde_hdr_off: true, ..full() }] {
+        for support in [
+            none(),
+            HdrSupport { driver: "x11".into(), ..none() },
+            HdrSupport { kde_hdr_off: true, ..full() },
+            HdrSupport { kde_no_hdr_display: true, ..full() },
+        ] {
             let mut form = Form::new(&d, &support);
             assert!(!form.hdr_on, "unticked: {support:?}");
             click(&mut form, check_hit_rect());
@@ -1533,6 +1547,21 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_without_an_hdr_display_cannot_tick_hdr() {
+        // the reported bug: Vulkan offers HDR surfaces, but KDE knows there is no HDR display
+        let no_display = HdrSupport { kde_no_hdr_display: true, ..full() };
+        let mut d = defaults();
+        d.hdr = HdrMode::Hdr10;
+        let mut form = Form::new(&d, &no_display);
+        assert!(!form.hdr_on);
+        click(&mut form, check_hit_rect());
+        assert!(!form.hdr_on);
+        assert_eq!(form.to_settings().hdr, HdrMode::Sdr);
+        let note = support_note(&no_display).1.join(" ");
+        assert!(note.contains("no HDR-capable display"), "{note}");
+    }
+
+    #[test]
     fn signal_menu_only_offers_available_modes() {
         let hlg_only = HdrSupport { hlg: true, ..none() };
         let mut form = Form::new(&defaults(), &hlg_only);
@@ -1562,6 +1591,7 @@ mod tests {
             HdrSupport { hdr10: true, ..none() },
             HdrSupport { hlg: true, ..none() },
             HdrSupport { kde_hdr_off: true, ..full() },
+            HdrSupport { kde_no_hdr_display: true, ..full() },
             none(),
             HdrSupport { driver: "x11".into(), ..none() },
             HdrSupport { driver: "some-very-long-video-driver-name-that-goes-on-and-on".into(), ..none() },
@@ -1615,6 +1645,7 @@ mod tests {
         render("unsupported_wayland", &form);
         render("unsupported_x11", &Form::new(&d, &HdrSupport { driver: "x11".into(), ..none() }));
         render("kde_off", &Form::new(&d, &HdrSupport { kde_hdr_off: true, ..full() }));
+        render("kde_no_display", &Form::new(&d, &HdrSupport { kde_no_hdr_display: true, ..full() }));
 
         let mut form = Form::new(&d, &full());
         form.focus = F_DD0 + DD_MAX_LUM;

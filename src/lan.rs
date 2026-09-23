@@ -256,10 +256,17 @@ fn configure_socket(stream: &TcpStream) {
 }
 
 /// Shared state between drawing and network threads.
-pub struct SharedState { pub connected: bool, pub shapes: Vec<ShapeInstruction>, pub current_measure_colour: ColorRGB, pub request_colour: ColorRGB }
+pub struct SharedState {
+    pub connected: bool,
+    pub shapes: Vec<ShapeInstruction>,
+    pub current_measure_colour: ColorRGB,
+    pub request_colour: ColorRGB,
+    /// Bit depth (per channel) of the most recent patch; `None` until the first one arrives.
+    pub patch_bits: Option<u8>,
+}
 
 impl Default for SharedState {
-    fn default() -> Self { Self { connected: false, shapes: Vec::new(), current_measure_colour: ColorRGB::default(), request_colour: ColorRGB::default() } }
+    fn default() -> Self { Self { connected: false, shapes: Vec::new(), current_measure_colour: ColorRGB::default(), request_colour: ColorRGB::default(), patch_bits: None } }
 }
 
 /// Lock helpers that survive a poisoned lock: the state is plain data, so the last written
@@ -301,17 +308,25 @@ fn apply_measurement(state: &RwLock<SharedState>, meas: MeasurementResult) {
         Some(ShapeInstruction::Rectangle(rect)) => Some(rect.color),
         None => None,
     };
+    // The depth the patches are in (a colour without a depth counts as 8-bit, as everywhere else).
+    let shapes_bits = meas
+        .shapes
+        .iter()
+        .map(|ShapeInstruction::Rectangle(rect)| if rect.color.depth_bits == 0 { 8 } else { rect.color.depth_bits })
+        .max();
     let mut w = write_state(state);
     w.connected = true;
     match first_colour {
         Some(colour) => {
             w.current_measure_colour = colour;
             w.shapes = meas.shapes;
+            w.patch_bits = shapes_bits;
         }
         None => {
             let bits = meas.depth_bits.unwrap_or_else(|| infer_depth_bits(meas.red, meas.green, meas.blue));
             w.current_measure_colour = ColorRGB::from_components_u16(meas.red, meas.green, meas.blue, bits);
             w.shapes.clear();
+            w.patch_bits = Some(bits);
         }
     }
 }
@@ -532,6 +547,7 @@ mod tests {
         conn.write_all(&frame(RECT)).unwrap();
         wait_until("first patch", || read_state(&state).shapes.len() == 1);
         assert_eq!(read_state(&state).current_measure_colour.red, 512);
+        assert_eq!(read_state(&state).patch_bits, Some(10), "the depth of the latest patch is published");
 
         // --- ColourSpace drops the connection; the worker must come back by itself ---
         drop(conn);
@@ -540,9 +556,10 @@ mod tests {
         let n = conn2.read(&mut buf).unwrap();
         assert!(String::from_utf8_lossy(&buf[..n]).contains("init profile"), "handshake repeated");
 
-        let second = RECT.replace("512", "100");
+        let second = RECT.replace("512", "100").replace("bits=\"10\"", "bits=\"8\"");
         conn2.write_all(&frame(&second)).unwrap();
         wait_until("patch after reconnect", || read_state(&state).current_measure_colour.red == 100);
+        assert_eq!(read_state(&state).patch_bits, Some(8), "and it follows a change of depth");
         assert!(read_state(&state).connected);
     }
 }

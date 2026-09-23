@@ -105,6 +105,42 @@ impl Output {
         }
     }
 
+    fn is_vulkan(&self) -> bool {
+        matches!(self, Output::Vulkan(_))
+    }
+
+    /// Bits per channel this output really delivers: 8 for SDL, 8 or 10 for the Vulkan surface.
+    fn output_bits(&self) -> u8 {
+        match self {
+            Output::Sdr(_) => 8,
+            Output::Vulkan(hdr) => hdr.surface_bits(),
+        }
+    }
+
+    /// ColourSpace is sending patches of `bits` bits: let SDR switch to the surface format that
+    /// matches, and describe what is now in use (for the terminal).
+    fn apply_patch_bits(&mut self, bits: u8) -> Result<String, Box<dyn Error>> {
+        Ok(match self {
+            Output::Sdr(_) if bits > 8 => format!(
+                "patch bit depth {bits}: SDL renderer, 8-bit output (10-bit is not available here, \
+                 the values are rounded to 8 bits)"
+            ),
+            Output::Sdr(_) => format!("patch bit depth {bits}: SDL renderer, 8-bit output"),
+            Output::Vulkan(hdr) => {
+                hdr.set_patch_bits(bits)?;
+                let out_bits = hdr.surface_bits();
+                let mut msg =
+                    format!("patch bit depth {bits}: {out_bits}-bit surface, format {}", hdr.format_description());
+                if bits > 8 && out_bits < 10 {
+                    msg.push_str(" (10-bit is not available here, the values are rounded to 8 bits)");
+                } else if bits > out_bits {
+                    msg.push_str(&format!(" (the values are reduced to {out_bits} bits)"));
+                }
+                msg
+            }
+        })
+    }
+
     /// Current drawable size in pixels. For HDR this also rebuilds the swapchain after a
     /// resize, so the returned size is always the real framebuffer size.
     fn size(&mut self) -> Result<(u32, u32), Box<dyn Error>> {
@@ -143,6 +179,25 @@ fn add_default_port(s: &str) -> String {
         }
         _ => format!("[{s}]:{DEFAULT_PORT}"), // bare IPv6 address
     }
+}
+
+/// What the title bar says about the SDR output in use:
+///
+/// * `SDR 8-bit` / `SDR 10-bit`: the surface matching the patches (Vulkan path)
+/// * `... SDL`: only the SDL renderer is available (always 8-bit)
+/// * `SDR 10-bit not available, 8-bit`: ColourSpace sends 10-bit patches but the output can only
+///   show 8 bits, so they are rounded
+/// * `SDR 10-bit, input 12-bit`: patches deeper than 10 bits are reduced to 10
+fn sdr_tag(vulkan: bool, output_bits: u8, patch_bits: Option<u8>) -> String {
+    let mut tag = match patch_bits {
+        Some(bits) if bits > 8 && output_bits < 10 => format!("SDR 10-bit not available, {output_bits}-bit"),
+        Some(bits) if bits > output_bits => format!("SDR {output_bits}-bit, input {bits}-bit"),
+        _ => format!("SDR {output_bits}-bit"),
+    };
+    if !vulkan {
+        tag.push_str(" SDL");
+    }
+    tag
 }
 
 /// Window title: shows the output in use (`tag`: "HDR10", "HLG", "SDR 10-bit"; none for the
@@ -226,11 +281,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     const DEFAULT_H: u32 = 720;
 
     // What the title bar says about the output ("HDR10", "HLG", "SDR 10-bit"); none for plain SDL.
-    let mut title_tag: Option<&'static str> = match hdr_mode {
-        HdrMode::Hdr10 => Some("HDR10"),
-        HdrMode::Hlg => Some("HLG"),
-        HdrMode::Sdr if use_sdr10 => Some("SDR 10-bit"),
-        HdrMode::Sdr => None,
+    let mut title_tag: Option<String> = match hdr_mode {
+        HdrMode::Hdr10 => Some("HDR10".to_string()),
+        HdrMode::Hlg => Some("HLG".to_string()),
+        // the Vulkan path starts on its 10-bit surface until the first patch says otherwise
+        HdrMode::Sdr => Some(sdr_tag(use_sdr10, if use_sdr10 { 10 } else { 8 }, None)),
     };
 
     // Always start windowed; fullscreen only via double-click
@@ -342,22 +397,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         HdrMode::Sdr => {
             let mut presenter = None;
             if use_sdr10 {
-                match HdrPresenter::new(make_window(title_tag)?, HdrMode::Sdr, metadata) {
+                match HdrPresenter::new(make_window(title_tag.as_deref())?, HdrMode::Sdr, metadata) {
                     Ok(p) => presenter = Some(p),
                     Err(err) => {
                         // Unlike HDR, falling back is exactly right here: the SDL renderer is the
                         // proven path, and SDR is what was asked for either way.
                         eprintln!("10-bit SDR output could not be started ({err}); using the standard 8-bit renderer");
-                        title_tag = None;
+                        title_tag = Some(sdr_tag(false, 8, None));
                     }
                 }
             }
             match presenter {
                 Some(p) => Output::Vulkan(p),
-                None => Output::Sdr(make_window(title_tag)?.into_canvas().build()?),
+                None => Output::Sdr(make_window(title_tag.as_deref())?.into_canvas().build()?),
             }
         }
-        mode => match HdrPresenter::new(make_window(title_tag)?, mode, metadata) {
+        mode => match HdrPresenter::new(make_window(title_tag.as_deref())?, mode, metadata) {
             Ok(presenter) => Output::Vulkan(presenter),
             Err(err) => {
                 // Never fall back to SDR silently: measuring the wrong signal is worse than failing.
@@ -368,7 +423,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         },
     };
-    let mut title_shows_disconnected = false;
+    // What the title bar currently shows, and the bit depth of the patches the output was last
+    // adapted to.
+    let mut shown_title = window_title(title_tag.as_deref(), false);
+    let mut applied_bits: Option<u8> = None;
 
     // The mouse pointer is hidden while the window is fullscreen (it would sit on top of the
     // patch and light it) and comes back in windowed mode.
@@ -484,15 +542,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         seen_fullscreen = fullscreen_now;
 
         // One read of the worker state per frame
-        let (disconnected, shapes, worker_current_colour) = {
+        let (disconnected, shapes, worker_current_colour, patch_bits) = {
             let r = lan::read_state(&worker);
-            (!r.connected, r.shapes.clone(), r.current_measure_colour)
+            (!r.connected, r.shapes.clone(), r.current_measure_colour, r.patch_bits)
         };
 
-        // Show in the title bar when the link to ColourSpace drops (the worker reconnects itself)
-        if disconnected != title_shows_disconnected {
-            title_shows_disconnected = disconnected;
-            output.window_mut().set_title(&window_title(title_tag, disconnected)).ok();
+        // ColourSpace changed the bit depth of its patches: SDR switches to the surface format
+        // that matches (8-bit patches -> 8-bit surface, 10-bit -> 10-bit) so nothing downstream
+        // has to round. The terminal says which format is now in use.
+        if let Some(bits) = patch_bits {
+            if applied_bits != Some(bits) {
+                applied_bits = Some(bits);
+                eprintln!("Output: {}", output.apply_patch_bits(bits)?);
+            }
+        }
+
+        // The title shows the output in use (SDR: 8/10-bit, SDL or not) and a lost connection
+        // (the worker reconnects itself).
+        let tag = if hdr_mode == HdrMode::Sdr {
+            Some(sdr_tag(output.is_vulkan(), output.output_bits(), applied_bits))
+        } else {
+            title_tag.clone()
+        };
+        let desired_title = window_title(tag.as_deref(), disconnected);
+        if desired_title != shown_title {
+            output.window_mut().set_title(&desired_title).ok();
+            shown_title = desired_title;
         }
 
         // Update current measure colour depending on worker state and shapes
@@ -621,6 +696,22 @@ mod tests {
         assert_eq!(add_default_port("fe80::1"), "[fe80::1]:20002");
         assert_eq!(add_default_port("[::1]"), "[::1]:20002");
         assert_eq!(add_default_port("[::1]:5000"), "[::1]:5000");
+    }
+
+    #[test]
+    fn the_sdr_tag_says_what_is_really_in_use() {
+        // Vulkan path: the surface follows the patches
+        assert_eq!(sdr_tag(true, 8, Some(8)), "SDR 8-bit");
+        assert_eq!(sdr_tag(true, 10, Some(10)), "SDR 10-bit");
+        assert_eq!(sdr_tag(true, 10, None), "SDR 10-bit", "before the first patch");
+        assert_eq!(sdr_tag(true, 10, Some(12)), "SDR 10-bit, input 12-bit");
+        // only SDL (8-bit): 8-bit patches are fine, 10-bit ones cannot be shown as such
+        assert_eq!(sdr_tag(false, 8, None), "SDR 8-bit SDL");
+        assert_eq!(sdr_tag(false, 8, Some(8)), "SDR 8-bit SDL");
+        assert_eq!(sdr_tag(false, 8, Some(10)), "SDR 10-bit not available, 8-bit SDL");
+        assert_eq!(sdr_tag(false, 8, Some(12)), "SDR 10-bit not available, 8-bit SDL");
+        // a Vulkan surface that has no 10-bit format
+        assert_eq!(sdr_tag(true, 8, Some(10)), "SDR 10-bit not available, 8-bit");
     }
 
     #[test]

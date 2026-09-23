@@ -215,12 +215,15 @@ pub struct HdrSupport {
     /// KWin still offers HDR10 surfaces on such a display (it tone-maps them to SDR), so
     /// a measurement would silently be taken from a converted SDR signal.
     pub kde_hdr_off: bool,
+    /// KDE reports no HDR-capable display at all (no monitor that can do HDR, or one on a port or
+    /// cable that cannot). Vulkan still offers HDR surfaces then, exactly as when HDR is off.
+    pub kde_no_hdr_display: bool,
 }
 
 impl HdrSupport {
     /// Can an HDR window be used (and trusted) here?
     pub fn any(&self) -> bool {
-        (self.hdr10 || self.hlg) && !self.kde_hdr_off
+        (self.hdr10 || self.hlg) && !self.kde_hdr_off && !self.kde_no_hdr_display
     }
 }
 
@@ -242,10 +245,22 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
+/// What KDE says about HDR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KdeHdr {
+    /// At least one display has HDR switched on.
+    On,
+    /// HDR-capable display(s), but HDR is switched off.
+    Off,
+    /// The report lists displays but none of them is HDR-capable ("HDR: incapable", or no HDR
+    /// entry at all, which is what displays without HDR support get).
+    NoHdrDisplay,
+}
+
 /// Read the HDR state out of `kscreen-doctor -o` (text, "HDR: enabled") or `-j` (JSON,
-/// `"hdr": true`) output. `Some(true)` if any display has HDR on, `Some(false)` if displays
-/// report it and all are off, `None` if the output says nothing usable (fail-safe: unknown).
-fn parse_kde_hdr_state(text: &str) -> Option<bool> {
+/// `"hdr": true`). `None` if the output is not a display report at all (tool missing, failed,
+/// or an unknown format): unknown never disables anything.
+fn parse_kde_hdr_state(text: &str) -> Option<KdeHdr> {
     let clean = strip_ansi(text).to_lowercase();
     let (mut on, mut off) = (false, false);
     for key in ["hdr:", "\"hdr\":"] {
@@ -261,26 +276,32 @@ fn parse_kde_hdr_state(text: &str) -> Option<bool> {
         }
     }
     if on {
-        Some(true)
+        Some(KdeHdr::On)
     } else if off {
-        Some(false)
+        Some(KdeHdr::Off)
+    } else if clean.contains("output:") || clean.contains("\"outputs\"") {
+        // A real display report in which no display offers HDR control.
+        Some(KdeHdr::NoHdrDisplay)
     } else {
         None
     }
 }
 
-/// Ask KDE whether HDR is enabled. `run` executes `kscreen-doctor` with the given arguments
-/// and returns everything it printed. Only KDE sessions are asked.
-fn kde_hdr_state_with(desktop: &str, run: impl Fn(&[&str]) -> Option<String>) -> Option<bool> {
+/// Ask KDE about HDR. `run` executes `kscreen-doctor` with the given arguments and returns
+/// everything it printed. Only KDE sessions are asked.
+fn kde_hdr_state_with(desktop: &str, run: impl Fn(&[&str]) -> Option<String>) -> Option<KdeHdr> {
     if !desktop.to_lowercase().contains("kde") {
         return None;
     }
+    let mut no_hdr_display = false;
     for args in [&["-o"][..], &["-j"][..]] {
-        if let Some(state) = run(args).and_then(|text| parse_kde_hdr_state(&text)) {
-            return Some(state);
+        match run(args).and_then(|text| parse_kde_hdr_state(&text)) {
+            Some(state @ (KdeHdr::On | KdeHdr::Off)) => return Some(state),
+            Some(KdeHdr::NoHdrDisplay) => no_hdr_display = true,
+            None => {}
         }
     }
-    None
+    no_hdr_display.then_some(KdeHdr::NoHdrDisplay)
 }
 
 /// Run `kscreen-doctor`, giving up after a few seconds. Its text output goes through Qt's
@@ -311,6 +332,89 @@ const HDR_FORMATS: [vk::Format; 2] = [
     vk::Format::A2B10G10R10_UNORM_PACK32, // preferred: NVIDIA can scan this out directly
     vk::Format::A2R10G10B10_UNORM_PACK32,
 ];
+
+/// 8-bit formats for plain SDR. `UNORM`, deliberately not `_SRGB`: the code values from
+/// ColourSpace are already sRGB-encoded, and an `_SRGB` format would make the GPU apply the sRGB
+/// curve to them a second time on every write, changing them. `UNORM` stores the value as it is.
+const SDR8_FORMATS: [vk::Format; 2] = [vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_UNORM];
+
+/// The two surface formats plain SDR switches between, depending on the bit depth of the patches
+/// (each only if the surface offers it): so an 8-bit patch is stored in an 8-bit surface and a
+/// 10-bit patch in a 10-bit one, with no rounding by anything downstream in either case.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SdrFormats {
+    bits8: Option<vk::SurfaceFormatKHR>,
+    bits10: Option<vk::SurfaceFormatKHR>,
+}
+
+impl SdrFormats {
+    fn from_surface(formats: &[vk::SurfaceFormatKHR]) -> Self {
+        let find = |wanted: &[vk::Format]| {
+            wanted.iter().find_map(|wf| {
+                formats
+                    .iter()
+                    .find(|f| f.format == *wf && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
+                    .copied()
+            })
+        };
+        SdrFormats { bits8: find(&SDR8_FORMATS), bits10: find(&HDR_FORMATS) }
+    }
+
+    /// The format for patches of `bits` bits: the 8-bit one up to 8 bits, the 10-bit one above
+    /// (12/16-bit patches also go there and are reduced to 10 bits). If the wanted one is not
+    /// offered the other is used, so there is always an answer when either exists.
+    fn for_patch_bits(&self, bits: u8) -> Option<vk::SurfaceFormatKHR> {
+        if bits <= 8 {
+            self.bits8.or(self.bits10)
+        } else {
+            self.bits10.or(self.bits8)
+        }
+    }
+}
+
+/// Bits per colour channel of a surface format we use (8 or 10).
+fn format_bits(format: vk::Format) -> u8 {
+    if HDR_FORMATS.contains(&format) {
+        10
+    } else {
+        8
+    }
+}
+
+/// A render pass with one cleared colour attachment of `format`, presented afterwards. Its format
+/// must match the swapchain's, so it is rebuilt whenever SDR switches between 8 and 10 bits.
+fn make_render_pass(device: &ash::Device, format: vk::Format) -> Result<vk::RenderPass, vk::Result> {
+    let attachment = [vk::AttachmentDescription::default()
+        .format(format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+    let colour_ref = [vk::AttachmentReference::default()
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+    let subpass = [vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(&colour_ref)];
+    let dependency = [vk::SubpassDependency::default()
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        .dst_subpass(0)
+        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+    unsafe {
+        device.create_render_pass(
+            &vk::RenderPassCreateInfo::default()
+                .attachments(&attachment)
+                .subpasses(&subpass)
+                .dependencies(&dependency),
+            None,
+        )
+    }
+}
 
 /// (HDR10 PQ offered, HLG offered, 10-bit SDR offered) among a surface's formats.
 fn classify_formats(formats: &[vk::SurfaceFormatKHR]) -> (bool, bool, bool) {
@@ -357,7 +461,8 @@ fn probe_with(ask_desktop: bool) -> HdrSupport {
     } else {
         None
     };
-    support.kde_hdr_off = kde_state == Some(false);
+    support.kde_hdr_off = kde_state == Some(KdeHdr::Off);
+    support.kde_no_hdr_display = kde_state == Some(KdeHdr::NoHdrDisplay);
     eprintln!(
         "HDR check: HDR10={} HLG={} SDR-10bit={} (SDL driver: {}){}{}",
         support.hdr10,
@@ -365,8 +470,9 @@ fn probe_with(ask_desktop: bool) -> HdrSupport {
         support.sdr10,
         if support.driver.is_empty() { "?" } else { &support.driver },
         match kde_state {
-            Some(true) => ", KDE display HDR: on",
-            Some(false) => ", KDE display HDR: OFF",
+            Some(KdeHdr::On) => ", KDE display HDR: on",
+            Some(KdeHdr::Off) => ", KDE display HDR: OFF",
+            Some(KdeHdr::NoHdrDisplay) => ", KDE: NO HDR-capable display",
             None if desktop.to_lowercase().contains("kde") => ", KDE display HDR: unknown",
             None => "",
         },
@@ -552,6 +658,8 @@ pub struct HdrPresenter {
     swapchain_loader: khr::swapchain::Device,
     hdr_loader: Option<ext::hdr_metadata::Device>,
     surface_format: vk::SurfaceFormatKHR,
+    /// SDR only: the 8-bit and 10-bit formats to switch between (see `set_patch_bits`).
+    sdr_formats: Option<SdrFormats>,
     metadata: HdrMetadata,
     render_pass: vk::RenderPass,
     command_pool: vk::CommandPool,
@@ -692,12 +800,12 @@ impl HdrPresenter {
                     .copied()
             });
             if let Some(format) = format {
-                chosen = Some((pd, queue_family, format, name, has_dev_ext(ext::hdr_metadata::NAME)));
+                chosen = Some((pd, queue_family, format, name, has_dev_ext(ext::hdr_metadata::NAME), formats.clone()));
                 break;
             }
         }
 
-        let Some((physical_device, queue_family, surface_format, device_name, has_hdr_md)) = chosen
+        let Some((physical_device, queue_family, surface_format, device_name, has_hdr_md, device_formats)) = chosen
         else {
             let mut msg = if mode == HdrMode::Sdr {
                 String::from("No GPU offers a 10-bit SDR surface for this window.")
@@ -719,10 +827,14 @@ impl HdrPresenter {
         };
         // Static HDR metadata only makes sense for HDR signals.
         let has_hdr_md = has_hdr_md && mode != HdrMode::Sdr;
-        if mode == HdrMode::Sdr {
+        // Plain SDR keeps both an 8-bit and a 10-bit format ready and switches with the patches.
+        let sdr_formats = (mode == HdrMode::Sdr).then(|| SdrFormats::from_surface(&device_formats));
+        if let Some(f) = &sdr_formats {
             eprintln!(
-                "SDR: 10-bit output on \"{}\" using {:?} / {:?}",
-                device_name, surface_format.format, surface_format.color_space
+                "SDR: Vulkan output on \"{}\": 10-bit {:?}, 8-bit {:?} (chosen by the patch bit depth)",
+                device_name,
+                f.bits10.map(|x| x.format),
+                f.bits8.map(|x| x.format)
             );
         } else {
             eprintln!(
@@ -762,36 +874,7 @@ impl HdrPresenter {
         let hdr_loader = has_hdr_md.then(|| ext::hdr_metadata::Device::new(&instance, &device));
 
         // ---- render pass (single colour attachment, cleared, presented) ---------------
-        let attachment = [vk::AttachmentDescription::default()
-            .format(surface_format.format)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
-        let colour_ref = [vk::AttachmentReference::default()
-            .attachment(0)
-            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
-        let subpass = [vk::SubpassDescription::default()
-            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(&colour_ref)];
-        let dependency = [vk::SubpassDependency::default()
-            .src_subpass(vk::SUBPASS_EXTERNAL)
-            .dst_subpass(0)
-            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
-        let render_pass = unsafe {
-            device.create_render_pass(
-                &vk::RenderPassCreateInfo::default()
-                    .attachments(&attachment)
-                    .subpasses(&subpass)
-                    .dependencies(&dependency),
-                None,
-            )?
-        };
+        let render_pass = make_render_pass(&device, surface_format.format)?;
 
         cleanup.render_pass = render_pass;
 
@@ -837,6 +920,7 @@ impl HdrPresenter {
             swapchain_loader,
             hdr_loader,
             surface_format,
+            sdr_formats,
             metadata,
             render_pass,
             command_pool,
@@ -859,6 +943,45 @@ impl HdrPresenter {
 
     pub fn window_mut(&mut self) -> &mut Window {
         &mut self.window
+    }
+
+    /// Bits per colour channel of the surface format in use (8 or 10).
+    pub fn surface_bits(&self) -> u8 {
+        format_bits(self.surface_format.format)
+    }
+
+    /// The surface format in use, for the terminal.
+    pub fn format_description(&self) -> String {
+        format!("{:?} / {:?}", self.surface_format.format, self.surface_format.color_space)
+    }
+
+    /// Plain SDR only: use the surface format that matches the bit depth of the patches ColourSpace
+    /// sends (8-bit patches -> an 8-bit surface, 10-bit patches -> a 10-bit one), so no stage after
+    /// this program has to round anything. Returns whether the format changed (which rebuilds the
+    /// swapchain). HDR signals are always 10-bit and are left alone.
+    pub fn set_patch_bits(&mut self, bits: u8) -> Result<bool, HdrError> {
+        let Some(target) = self.sdr_formats.and_then(|f| f.for_patch_bits(bits)) else {
+            return Ok(false);
+        };
+        if target.format == self.surface_format.format {
+            return Ok(false);
+        }
+        self.switch_format(target)?;
+        Ok(true)
+    }
+
+    /// Change the surface format: the render pass and the swapchain both depend on it.
+    fn switch_format(&mut self, target: vk::SurfaceFormatKHR) -> Result<(), HdrError> {
+        unsafe { self.device.device_wait_idle()? };
+        self.destroy_swapchain_resources();
+        unsafe { self.device.destroy_render_pass(self.render_pass, None) };
+        self.render_pass = vk::RenderPass::null();
+        self.render_pass = make_render_pass(&self.device, target.format)?;
+        self.surface_format = target;
+        match self.recreate_swapchain() {
+            Err(HdrError::Vk(vk::Result::ERROR_SURFACE_LOST_KHR)) => self.recreate_surface(),
+            other => other,
+        }
     }
 
     /// Drawable size in physical pixels, as SDL reports it.
@@ -1259,19 +1382,34 @@ mod tests {
     fn kde_hdr_state_is_read_from_kscreen_doctor_output() {
         let off = "Output: 1 DP-1 enabled connected\n\tGeometry: 0,0 3840x2160\n\tHDR: disabled\n\tWide Color Gamut: disabled\n";
         let on = "Output: 1 DP-1 enabled connected\n\tHDR: enabled\n\tSDR brightness: 300\n";
-        assert_eq!(parse_kde_hdr_state(off), Some(false));
-        assert_eq!(parse_kde_hdr_state(on), Some(true));
+        assert_eq!(parse_kde_hdr_state(off), Some(KdeHdr::Off));
+        assert_eq!(parse_kde_hdr_state(on), Some(KdeHdr::On));
         // one HDR display among several is enough
-        assert_eq!(parse_kde_hdr_state(&format!("{off}{on}")), Some(true));
+        assert_eq!(parse_kde_hdr_state(&format!("{off}{on}")), Some(KdeHdr::On));
         // coloured output, and everything on one line
-        assert_eq!(parse_kde_hdr_state("Output: 1 HDR: \u{1b}[01;31mdisabled\u{1b}[0;0m Vrr: Automatic"), Some(false));
+        assert_eq!(
+            parse_kde_hdr_state("Output: 1 HDR: \u{1b}[01;31mdisabled\u{1b}[0;0m Vrr: Automatic"),
+            Some(KdeHdr::Off)
+        );
         // JSON form
-        assert_eq!(parse_kde_hdr_state("{\"outputs\":[{\"hdr\": false,\"name\":\"DP-1\"}]}"), Some(false));
-        assert_eq!(parse_kde_hdr_state("{\"outputs\":[{\"hdr\":true}]}"), Some(true));
-        // nothing usable -> unknown, never "off"
-        assert_eq!(parse_kde_hdr_state("Output: 1 HDR: incapable"), None);
+        assert_eq!(parse_kde_hdr_state("{\"outputs\":[{\"hdr\": false,\"name\":\"DP-1\"}]}"), Some(KdeHdr::Off));
+        assert_eq!(parse_kde_hdr_state("{\"outputs\":[{\"hdr\":true}]}"), Some(KdeHdr::On));
+        // not a display report at all -> unknown, which never disables anything
         assert_eq!(parse_kde_hdr_state("kscreen-doctor: command not found"), None);
         assert_eq!(parse_kde_hdr_state(""), None);
+    }
+
+    #[test]
+    fn a_kde_report_without_any_hdr_capable_display_is_recognised() {
+        // displays that cannot do HDR say so ("incapable") or simply have no HDR entry
+        let incapable = "Output: 1 HDMI-A-1 enabled connected priority 1\n\tHDR: incapable\n\tWide Color Gamut: incapable\n";
+        let silent = "Output: 1 HDMI-A-1 enabled connected priority 1 HDMI\n\tModes: 1:1920x1080@60*\n\tScale: 1\n";
+        let json = "{\"outputs\":[{\"name\":\"HDMI-A-1\",\"enabled\":true}]}";
+        for text in [incapable, silent, json] {
+            assert_eq!(parse_kde_hdr_state(text), Some(KdeHdr::NoHdrDisplay), "{text}");
+        }
+        // but a single HDR-capable display among incapable ones counts
+        assert_eq!(parse_kde_hdr_state(&format!("{incapable}Output: 2 DP-1\n\tHDR: disabled\n")), Some(KdeHdr::Off));
     }
 
     #[test]
@@ -1280,18 +1418,22 @@ mod tests {
         let calls = Cell::new(0);
         let run = |_: &[&str]| {
             calls.set(calls.get() + 1);
-            Some("HDR: disabled".to_string())
+            Some("Output: 1 DP-1\n\tHDR: disabled".to_string())
         };
         assert_eq!(kde_hdr_state_with("GNOME", &run), None);
         assert_eq!(calls.get(), 0, "other desktops are not queried");
-        assert_eq!(kde_hdr_state_with("KDE", &run), Some(false));
-        assert_eq!(kde_hdr_state_with("KDE:Plasma", &run), Some(false));
+        assert_eq!(kde_hdr_state_with("KDE", &run), Some(KdeHdr::Off));
+        assert_eq!(kde_hdr_state_with("KDE:Plasma", &run), Some(KdeHdr::Off));
 
         // -o says nothing usable, -j does
         let json_only = |args: &[&str]| Some(if args == ["-j"] { "\"hdr\": true" } else { "nothing" }.to_string());
-        assert_eq!(kde_hdr_state_with("KDE", json_only), Some(true));
-        // tool missing
+        assert_eq!(kde_hdr_state_with("KDE", json_only), Some(KdeHdr::On));
+        // tool missing or failing: unknown
         assert_eq!(kde_hdr_state_with("KDE", |_: &[&str]| None), None);
+        assert_eq!(kde_hdr_state_with("KDE", |_: &[&str]| Some("command not found".to_string())), None);
+        // a display report with no HDR-capable display
+        let plain = |_: &[&str]| Some("Output: 1 HDMI-A-1 enabled connected".to_string());
+        assert_eq!(kde_hdr_state_with("KDE", plain), Some(KdeHdr::NoHdrDisplay));
     }
 
     /// Needs a stand-in `kscreen-doctor` first on PATH (run with `--ignored`); it must print
@@ -1300,14 +1442,56 @@ mod tests {
     #[ignore]
     fn kscreen_doctor_report_is_captured_from_stderr() {
         let text = run_kscreen_doctor(&["-o"]).expect("kscreen-doctor should run");
-        assert_eq!(parse_kde_hdr_state(&text), Some(false), "captured: {text:?}");
+        assert_eq!(parse_kde_hdr_state(&text), Some(KdeHdr::Off), "captured: {text:?}");
     }
 
     #[test]
-    fn kde_reporting_hdr_off_disables_hdr_even_if_vulkan_offers_it() {
+    fn kde_reporting_hdr_off_or_no_hdr_display_disables_hdr_even_if_vulkan_offers_it() {
         let offered = HdrSupport { hdr10: true, hlg: true, ..Default::default() };
         assert!(offered.any());
-        assert!(!HdrSupport { kde_hdr_off: true, ..offered }.any());
+        assert!(!HdrSupport { kde_hdr_off: true, ..offered.clone() }.any());
+        assert!(!HdrSupport { kde_no_hdr_display: true, ..offered }.any());
+    }
+
+    fn surface_format(format: vk::Format, space: vk::ColorSpaceKHR) -> vk::SurfaceFormatKHR {
+        vk::SurfaceFormatKHR { format, color_space: space }
+    }
+
+    #[test]
+    fn sdr_formats_are_unorm_and_chosen_by_patch_depth() {
+        use vk::ColorSpaceKHR as Cs;
+        use vk::Format as F;
+        let offered = [
+            surface_format(F::B8G8R8A8_SRGB, Cs::SRGB_NONLINEAR),
+            surface_format(F::B8G8R8A8_UNORM, Cs::SRGB_NONLINEAR),
+            surface_format(F::A2B10G10R10_UNORM_PACK32, Cs::SRGB_NONLINEAR),
+            surface_format(F::A2B10G10R10_UNORM_PACK32, Cs::HDR10_ST2084_EXT),
+        ];
+        let f = SdrFormats::from_surface(&offered);
+        assert_eq!(f.bits8.map(|x| x.format), Some(F::B8G8R8A8_UNORM), "never the _SRGB variant");
+        assert_eq!(f.bits10.map(|x| x.format), Some(F::A2B10G10R10_UNORM_PACK32));
+        assert_eq!(f.bits10.map(|x| x.color_space), Some(Cs::SRGB_NONLINEAR), "the HDR entry is not the SDR one");
+
+        for bits in [1u8, 8] {
+            assert_eq!(f.for_patch_bits(bits).map(|x| x.format), Some(F::B8G8R8A8_UNORM), "{bits}-bit patches");
+        }
+        for bits in [9u8, 10, 12, 16] {
+            assert_eq!(f.for_patch_bits(bits).map(|x| x.format), Some(F::A2B10G10R10_UNORM_PACK32), "{bits}-bit patches");
+        }
+
+        // R8G8B8A8 is accepted too, after B8G8R8A8
+        let rgba_only = SdrFormats::from_surface(&[surface_format(F::R8G8B8A8_UNORM, Cs::SRGB_NONLINEAR)]);
+        assert_eq!(rgba_only.bits8.map(|x| x.format), Some(F::R8G8B8A8_UNORM));
+
+        // a missing format falls back to the other one; nothing at all gives nothing
+        let only8 = SdrFormats { bits10: None, ..f };
+        assert_eq!(only8.for_patch_bits(10).map(|x| x.format), Some(F::B8G8R8A8_UNORM));
+        let only10 = SdrFormats { bits8: None, ..f };
+        assert_eq!(only10.for_patch_bits(8).map(|x| x.format), Some(F::A2B10G10R10_UNORM_PACK32));
+        assert_eq!(SdrFormats { bits8: None, bits10: None }.for_patch_bits(8), None);
+
+        assert_eq!(format_bits(F::B8G8R8A8_UNORM), 8);
+        assert_eq!(format_bits(F::A2R10G10B10_UNORM_PACK32), 10);
     }
 
     #[test]
