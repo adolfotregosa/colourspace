@@ -14,6 +14,15 @@ I'm not a developer. This project was built mostly with the help of a friend and
 - It works for me, but it comes as is, with no warranty. Please check your results with your own meter.
 - Feedback and bug reports are welcome.
 
+## Download (no compiling needed)
+
+A ready-to-run Linux build is available on the **[Releases page](https://github.com/adolfotregosa/colourspace/releases)**. Download the latest `calibrationclient-linux-x86_64.tar.gz`, then:
+
+```bash
+tar xzf calibrationclient-linux-x86_64.tar.gz
+cd CalibrationClient
+./calibrationclient
+```
 ## How to compile
 
 > **Important:** the current version is on the **`hdr-support`** branch. The default branch (`main`) does not have it yet, so make sure you are on `hdr-support` before building.
