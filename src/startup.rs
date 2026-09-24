@@ -1012,6 +1012,10 @@ fn draw_text_scaled<T: RenderTarget>(c: &mut Canvas<T>, x: i32, y: i32, s: &str,
     }
 }
 
+/// Shown at the bottom left of the window: "v" plus the major.minor of the package version, so
+/// changing `version` in Cargo.toml (0.1.x -> 0.2.0) is all it takes to update it.
+const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION_MAJOR"), ".", env!("CARGO_PKG_VERSION_MINOR"));
+
 const ADVANCED_LABEL: &str = "Advanced";
 const DEFAULTS_LABEL: &str = "Defaults";
 /// Shown (small, next to a closed "Advanced") when a value inside it is not at its default.
@@ -1181,6 +1185,9 @@ fn draw_form<T: RenderTarget>(c: &mut Canvas<T>, f: &Form) {
         // closed, but something inside is not at its default: say so
         draw_text_scaled(c, CTRL_X, ADV_Y + (ROW_H - 8) / 2, ADVANCED_CHANGED, NOTE_WARN, 1);
     }
+
+    // ---- version, bottom left, level with the buttons ---------------------------------------
+    draw_text(c, LABEL_X, f.cancel_rect().y() + (BTN_H - GLYPH) / 2, VERSION, MUTED);
 
     // ---- buttons --------------------------------------------------------------------
     let cancel = f.cancel_rect();
@@ -1696,6 +1703,19 @@ mod tests {
             key(&mut form, Keycode::Space);
             assert!(!form.advanced_open);
             assert!(!form.focusable(F_ADV));
+        }
+    }
+
+    #[test]
+    fn the_version_is_shown_and_fits_beside_the_buttons() {
+        // "v" + major.minor of the package version
+        assert!(VERSION.starts_with('v'));
+        assert!(env!("CARGO_PKG_VERSION").starts_with(&VERSION[1..]), "{VERSION} vs {}", env!("CARGO_PKG_VERSION"));
+        for open in [false, true] {
+            assert!(
+                LABEL_X + text_width(VERSION) < cancel_rect(open).x(),
+                "the version must not run into the Cancel button (advanced open: {open})"
+            );
         }
     }
 
