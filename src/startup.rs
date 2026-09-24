@@ -237,6 +237,11 @@ const NOTE_WARN: Color = Color::RGB(226, 168, 70);
 
 /// Message line(s) shown under the HDR checkbox: (colour, lines at 8px per character).
 /// Each line must fit the window (checked by a test): at most 66 characters.
+/// Why HDR cannot be used here, as one line (the same wording the startup window shows).
+pub fn hdr_unavailable_reason(support: &HdrSupport) -> String {
+    support_note(support).1.join(" ")
+}
+
 fn support_note(support: &HdrSupport) -> (Color, Vec<String>) {
     if (support.hdr10 || support.hlg) && support.kde_no_hdr_display {
         return (

@@ -77,6 +77,24 @@ impl Args {
     }
 }
 
+/// When HDR is asked for on the command line (so the startup window and its checks are skipped),
+/// is it really usable here? `Some(reason)` if not. Vulkan alone is not enough to tell: KDE keeps
+/// offering HDR surfaces when HDR is switched off, or when no display can do HDR, and the output
+/// would then be a tone-mapped SDR picture while claiming to be HDR.
+fn cli_hdr_problem(mode: HdrMode, support: &hdr::HdrSupport) -> Option<String> {
+    if mode == HdrMode::Sdr {
+        return None;
+    }
+    if !support.any() {
+        return Some(startup::hdr_unavailable_reason(support));
+    }
+    let offered = match mode {
+        HdrMode::Hlg => support.hlg,
+        _ => support.hdr10,
+    };
+    (!offered).then(|| format!("{} is not offered for this display. Try the other HDR signal.", mode.label()))
+}
+
 /// Starting values, lowest priority first: the built-in defaults, then what was remembered,
 /// then the options given on the command line. Remembered values only apply when the startup
 /// window is going to be shown (no address on the command line): a run that names its address
@@ -225,12 +243,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     // connection can simply bring the startup window back (with the same values) and the HDR
     // choice can still decide the SDL video driver, which must be set before SDL starts.
     let mut use_cli_address = args.remote.is_some();
-    // Whether HDR can be used here is only checked when the startup window is actually shown.
+    // What HDR can do here. Checked every time the startup window opens (HDR may have been
+    // switched on or off in the desktop in the meantime), and for HDR asked for on the command line.
     let mut hdr_support: Option<hdr::HdrSupport> = None;
+    // Whether the startup window was used: only then are the HDR choices worth remembering.
+    let mut window_shown = false;
+
+    // HDR on the command line skips the startup window, but not its checks.
+    if use_cli_address && settings.hdr != HdrMode::Sdr {
+        let support = hdr::probe();
+        if let Some(reason) = cli_hdr_problem(settings.hdr, &support) {
+            let text = format!("{} output is not available\n\n{}", settings.hdr.label(), reason);
+            eprintln!("{}", text.replace("\n\n", ": "));
+            let _ = tfd::message_box_ok("Calibration Client Linux", &text, tfd::MessageBoxIcon::Error);
+            return Err(text.into());
+        }
+        hdr_support = Some(support);
+    }
+
     let worker = loop {
         if !use_cli_address {
-            let support = hdr_support.get_or_insert_with(hdr::probe);
-            match startup::show(settings.clone(), support)? {
+            let support = hdr::probe();
+            window_shown = true;
+            let chosen = startup::show(settings.clone(), &support)?;
+            hdr_support = Some(support);
+            match chosen {
                 Some(chosen) => settings = chosen,
                 None => return Ok(()),
             }
@@ -244,7 +281,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // Only what worked is remembered. The HDR choices are only updated when the
                 // startup window was shown and HDR could really be chosen there; a temporary
                 // "HDR unavailable" must not wipe the preference.
-                let hdr_usable = hdr_support.as_ref().is_some_and(|s| s.any());
+                let hdr_usable = window_shown && hdr_support.as_ref().is_some_and(|s| s.any());
                 config::save(&settings.to_saved(hdr_usable, &saved));
                 break state;
             }
@@ -588,12 +625,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             current_measure_colour = select_measure_colour(&shapes).unwrap_or(current_measure_colour);
         }
 
-        // Draw
+        // Draw. While the connection is down the screen is black: a full field of the last patch
+        // colour could sit on screen for a long time (hard on OLEDs, especially bright HDR patches).
         let (cw, ch) = output.size()?;
         let show_shapes = !disconnected && !shapes.is_empty();
         match &mut output {
             Output::Sdr(canvas) => {
-                if show_shapes {
+                if disconnected {
+                    canvas.set_draw_color(Color::RGB(0, 0, 0));
+                    canvas.clear();
+                } else if show_shapes {
                     draw_shapes(canvas, &shapes, cw, ch);
                 } else {
                     let c = current_measure_colour;
@@ -607,8 +648,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 canvas.present();
             }
             Output::Vulkan(hdr) => {
-                // Code values go to the 10-bit HDR swapchain untouched (no 8-bit downscale).
-                if show_shapes {
+                // Code values go to the swapchain untouched (no 8-bit downscale).
+                if disconnected {
+                    hdr.draw([0.0, 0.0, 0.0], &[])?;
+                } else if show_shapes {
                     let rects = shapes_to_fill_rects(&shapes, cw, ch);
                     hdr.draw([0.0, 0.0, 0.0], &rects)?;
                 } else {
@@ -689,6 +732,33 @@ mod tests {
 
         let args = Args { remote: Some("10.0.0.7".into()), hdr: Some(HdrMode::Hlg), ..no_args() };
         assert_eq!(initial_settings(&args, &remembered()).hdr, HdrMode::Hlg);
+    }
+
+    fn support(hdr10: bool, hlg: bool) -> hdr::HdrSupport {
+        hdr::HdrSupport { hdr10, hlg, driver: "wayland".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn hdr_from_the_command_line_is_refused_where_the_window_would_refuse_it() {
+        assert_eq!(cli_hdr_problem(HdrMode::Sdr, &support(false, false)), None, "SDR needs nothing");
+        assert_eq!(cli_hdr_problem(HdrMode::Hdr10, &support(true, true)), None);
+        assert_eq!(cli_hdr_problem(HdrMode::Hlg, &support(true, true)), None);
+
+        // KDE says HDR is off, or there is no HDR display, although Vulkan offers the surfaces
+        let kde_off = hdr::HdrSupport { kde_hdr_off: true, ..support(true, true) };
+        let reason = cli_hdr_problem(HdrMode::Hdr10, &kde_off).expect("refused");
+        assert!(reason.contains("turned off"), "{reason}");
+        let no_display = hdr::HdrSupport { kde_no_hdr_display: true, ..support(true, true) };
+        assert!(cli_hdr_problem(HdrMode::Hdr10, &no_display).unwrap().contains("no HDR-capable display"));
+
+        // nothing offered at all, and X11
+        assert!(cli_hdr_problem(HdrMode::Hdr10, &support(false, false)).is_some());
+        let x11 = hdr::HdrSupport { driver: "x11".into(), ..support(false, false) };
+        assert!(cli_hdr_problem(HdrMode::Hdr10, &x11).unwrap().contains("Wayland"));
+
+        // the asked-for signal must be the one on offer
+        assert!(cli_hdr_problem(HdrMode::Hlg, &support(true, false)).unwrap().contains("HLG"));
+        assert!(cli_hdr_problem(HdrMode::Hdr10, &support(false, true)).unwrap().contains("HDR10"));
     }
 
     #[test]
