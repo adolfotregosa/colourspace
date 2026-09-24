@@ -29,12 +29,20 @@ cd CalibrationClient
 
 ### 1. Install what you need (Linux)
 
-- **Rust 1.85 or newer:** install it from https://rustup.rs, or update with `rustup update stable`.
-- **A C compiler, pkg-config and the SDL2 development files:**
-  - Debian / Ubuntu: `sudo apt install build-essential pkg-config libsdl2-dev`
-  - Fedora: `sudo dnf install gcc pkgconf-pkg-config SDL2-devel`
-  - Arch: `sudo pacman -S base-devel sdl2`
-- **To run it with HDR or 10-bit SDR:** a Vulkan driver for your GPU (for example Mesa on AMD and Intel, or the NVIDIA driver). Without one it still works, using SDL's normal 8-bit renderer.
+You need a Rust toolchain (**1.85 or newer**), a C compiler, `pkg-config` and the SDL2 development files. Install them with your distribution's package manager:
+
+- **Fedora** (where this was built and tested):
+```bash
+  sudo dnf install rust cargo gcc pkgconf-pkg-config SDL2-devel
+```
+- **Debian / Ubuntu** (not tested by me):
+```bash
+  sudo apt install build-essential pkg-config libsdl2-dev rustc cargo
+```
+- **Arch** (not tested by me):
+```bash
+  sudo pacman -S base-devel sdl2 rust
+```
 
 ### 2. Get the code on the right branch
 
