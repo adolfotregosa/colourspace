@@ -288,15 +288,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         HdrMode::Sdr => Some(sdr_tag(use_sdr10, if use_sdr10 { 10 } else { 8 }, None)),
     };
 
-    // Always start windowed; fullscreen only via double-click
-    let make_window = |tag: Option<&str>| {
-        video
-            .window(&window_title(tag, false), DEFAULT_W, DEFAULT_H)
-            .position_centered()
-            .vulkan()
-            .resizable()
-            .allow_highdpi()
-            .build()
+    // Always start windowed; fullscreen only via double-click.
+    // `vulkan`: the window can be used for a Vulkan swapchain (needed for HDR and 10-bit SDR).
+    let make_window = |tag: Option<&str>, vulkan: bool| {
+        let mut builder = video.window(&window_title(tag, false), DEFAULT_W, DEFAULT_H);
+        builder.position_centered().resizable().allow_highdpi();
+        if vulkan {
+            builder.vulkan();
+        }
+        builder.build()
+    };
+    // The window for the plain SDL renderer. It is created the way it always was (with the
+    // Vulkan flag), and only if that is refused, because this system has no usable Vulkan at
+    // all (no loader or no driver), without it. Without this the program would not start on such
+    // a system even though the SDL renderer needs no Vulkan.
+    let make_sdl_window = |tag: Option<&str>| match make_window(tag, true) {
+        Ok(window) => Ok(window),
+        Err(err) => {
+            eprintln!("Vulkan is not available here ({err}); using the SDL renderer without it");
+            make_window(tag, false)
+        }
     };
 
     fn select_measure_colour(shapes: &[ShapeInstruction]) -> Option<ColorRGB> {
@@ -397,7 +408,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         HdrMode::Sdr => {
             let mut presenter = None;
             if use_sdr10 {
-                match HdrPresenter::new(make_window(title_tag.as_deref())?, HdrMode::Sdr, metadata) {
+                match HdrPresenter::new(make_window(title_tag.as_deref(), true)?, HdrMode::Sdr, metadata) {
                     Ok(p) => presenter = Some(p),
                     Err(err) => {
                         // Unlike HDR, falling back is exactly right here: the SDL renderer is the
@@ -409,10 +420,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             match presenter {
                 Some(p) => Output::Vulkan(p),
-                None => Output::Sdr(make_window(title_tag.as_deref())?.into_canvas().build()?),
+                None => Output::Sdr(make_sdl_window(title_tag.as_deref())?.into_canvas().build()?),
             }
         }
-        mode => match HdrPresenter::new(make_window(title_tag.as_deref())?, mode, metadata) {
+        mode => match HdrPresenter::new(make_window(title_tag.as_deref(), true)?, mode, metadata) {
             Ok(presenter) => Output::Vulkan(presenter),
             Err(err) => {
                 // Never fall back to SDR silently: measuring the wrong signal is worse than failing.
