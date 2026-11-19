@@ -1,0 +1,23 @@
+[package]
+name = "calibrationclient"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sdl2 = "^0"
+thiserror = "^2"
+quick-xml = "0.30" # pinned: the code uses the 0.30 API (the Wayland crates bring their own newer copy)
+argh = "^0"
+tinyfiledialogs = "3.2"
+socket2 = { version = "0.5", features = ["all"] }
+ash = "0.38"
+font8x8 = "0.3"
+# Our own colour description for HDR windows (Wayland colour-management protocol). "dlopen": the
+# Wayland library is loaded at run time, so the program still starts where it is missing.
+wayland-client = { version = "0.31", features = ["system", "dlopen"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
+[dev-dependencies]
+# a stand-in compositor for testing our colour description at the protocol level
+wayland-server = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "server", "staging"] }

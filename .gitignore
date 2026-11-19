@@ -1,0 +1,21 @@
+# Only the sources and the Cargo files are published. Everything else in the
+# repository root is ignored, then the few files needed to build are added back.
+/*
+
+!/.gitignore
+!/src/
+!/Cargo.toml
+!/Cargo.lock
+
+# Never publish these, wherever they show up.
+github
+github.pub
+*.pem
+*.key
+target/
+dist/
+.vscode/
+.idea/
+protocol.txt
+calibrationclient.settings
+colourspace_commands.log
